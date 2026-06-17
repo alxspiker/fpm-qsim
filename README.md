@@ -46,6 +46,12 @@ As of v0.1.6, the `Circuit` layer composes unitary gates with FPM
 dephasing layers under a single closed-universe ledger, with automatic
 billing of every simulated operation's route cost.
 
+As of v0.1.7, `Circuit.run_with_replenishment` automates the closed-
+universe balancing: after each step, the daemon is replenished by
+exactly the energy debited that tick, keeping the conservation
+identity `replenish == spend + landauer` satisfied to ~0 drift
+(when no external Landauer is charged).
+
 For speed, the important distinction is structural vs constant-factor:
 pure dephasing can be implemented in `O(N^2)` per step by any
 dephasing-aware method.  `fpm-qsim` is competitive with that
@@ -352,6 +358,45 @@ depolarizing, etc.) remain out of scope: they have no FPM
 correspondence theorem.  Only the pure-dephasing affine map of
 Theorem 3 is wired in via `dephase`.
 
+### Closed-universe balancing (v0.1.7)
+
+`run_with_replenishment(rho0, n_steps)` is the same as `run()` but,
+after each `step()`, replenishes the daemon by exactly the energy
+debited that tick (spend + landauer).  This keeps the closed-universe
+identity `replenish == spend + landauer` satisfied to ~0 drift when
+no external Landauer is charged.
+
+```python
+ledger = fpm.ConservationLedger(E_max_total=100.0)
+daemon = ledger.add_daemon(80.0)
+circ = fpm.Circuit(
+    2, daemon=daemon, ledger=ledger, method="euler",
+    default_gate_power=0.05, cost_per_op=1e-5,
+)
+circ.h(0).cx(0, 1).dephase(dt=1.0)
+
+rho0 = fpm.pure_state([1, 0, 0, 0])
+traj = circ.run_with_replenishment(rho0, n_steps=20)
+# ledger.drift() is ~0 (no external Landauer).
+# daemon.E is preserved (balanced replenishment).
+```
+
+Honest behavior at the boundaries:
+
+- **Daemon near `E_max`**: replenishment is capped at `E_max - E`,
+  drift may grow.  The framework is reporting that `E_max_total` is
+  too small to absorb the requested computation.
+- **Daemon near the energy floor**: spend is capped (existing
+  behavior of `bill_compute_cost`), replenishment restores the
+  daemon.
+- **External Landauer**: debits charged via `ledger.record_landauer`
+  between `step()` calls are NOT replenished by this method.  The
+  caller is responsible for those.
+
+Requires `daemon` and `ledger` to be attached.  Raises `ValueError`
+otherwise, pointing users to plain `run()` for open-system
+simulations.
+
 ---
 
 ## What's distinctive about `fpm-qsim`
@@ -366,6 +411,7 @@ Theorem 3 is wired in via `dephase`.
 | Closed-universe ledger | **Yes** | --- | --- | --- |
 | Endogenous gamma from energy | **Yes (v0.1.5)** | --- | --- | --- |
 | Circuit layer with billing | **Yes (v0.1.6)** | --- | --- | --- |
+| Auto-balanced closed-universe runs | **Yes (v0.1.7)** | --- | --- | --- |
 | Combined unitary + dephasing | **`Circuit` queue or `strang_step`** | Built in | Built in | Channel-specific |
 
 The only Lindblad integrator in the Python ecosystem with a
@@ -491,6 +537,7 @@ initial state, wall time reported as the minimum of three repeats.
 | `Circuit.dephase(gamma=None, *, dt=1.0, gate_power=None, load=None)` | Append an FPM dephasing layer. Endogenous gamma derived from daemon if `gamma` is omitted. |
 | `Circuit.step(rho)` | Apply the full queued sequence once. Returns the next density matrix. |
 | `Circuit.run(rho0, n_steps=1, *, record=True)` | Apply `step()` `n_steps` times. Returns trajectory of shape `(n_steps+1, dim, dim)` if `record=True`, else final state. |
+| `Circuit.run_with_replenishment(rho0, n_steps=1, *, record=True)` | **v0.1.7.** Same as `run()` but replenishes the daemon by exactly the debited amount (spend + landauer) each tick, keeping the closed-universe ledger balanced. Requires `daemon` and `ledger` attached. |
 | `Circuit.strang_step(rho, H, gamma, dt, *, gate_power=None, load=None)` | One Strang-split round: `U(dt/2) + dephase(dt) + U(dt/2)`. Uses `expm(-i H dt/2)` for the half-steps. Bills three operations. |
 | `Circuit.reset()` | Clear the queue (does not reset billing counters). |
 | `Circuit.reset_stats()` | Reset billing counters (does not clear the queue). |
@@ -617,6 +664,20 @@ regime where the FPM theorem provides an algebraic correspondence.
 ---
 
 ## Changelog
+
+### 0.1.7 (2026-06-18)
+
+**`Circuit.run_with_replenishment` — automatic closed-universe balancing.**
+
+- Added `Circuit.run_with_replenishment(rho0, n_steps, *, record=True)`.
+  Same as `run()` but, after each `step()`, replenishes the daemon by
+  exactly the energy debited that tick (spend + landauer), keeping the
+  closed-universe identity `replenish == spend + landauer` satisfied
+  to within energy-floor/ceiling clipping.
+- Requires `daemon` and `ledger` attached; raises `ValueError`
+  otherwise (points users to `run()` for open-system simulations).
+- 18 new tests in `tests/test_circuit.py`. 145 tests total, all passing.
+- Updated `examples/05_circuit.py` to use the new method.
 
 ### 0.1.6 (2026-06-18)
 

@@ -744,6 +744,140 @@ class Circuit:
             traj[t] = rho
         return traj
 
+    def run_with_replenishment(
+        self,
+        rho0: np.ndarray,
+        n_steps: int = 1,
+        *,
+        record: bool = True,
+    ):
+        """Apply :meth:`step` ``n_steps`` times, replenishing the
+        daemon's energy each tick to keep the closed-universe ledger
+        balanced.
+
+        After each step, replenishes the daemon by exactly the energy
+        debited that tick (spend + landauer), keeping the closed-
+        universe identity
+
+            total_replenish == total_spend + total_landauer
+
+        satisfied to within energy-floor / energy-ceiling clipping.
+        This is the FPM closed-universe conservation theorem (paper
+        Test 03) made operational at the circuit level.
+
+        Requires ``daemon`` and ``ledger`` to be attached to the
+        circuit.  Use plain :meth:`run` if you want to manage
+        replenishment manually (or skip it for open-system
+        simulations).
+
+        Parameters
+        ----------
+        rho0 : ndarray, shape (dim, dim)
+            Initial density matrix.
+        n_steps : int, optional
+            Number of times to apply the queued sequence.  Default 1.
+        record : bool, optional
+            If True (default), return the full trajectory of shape
+            ``(n_steps + 1, dim, dim)``.  If False, return only the
+            final state.
+
+        Returns
+        -------
+        ndarray
+            Trajectory if ``record=True``, else final state.
+
+        Raises
+        ------
+        ValueError
+            If ``daemon`` or ``ledger`` is None, if ``n_steps < 0``,
+            or if ``rho0`` has the wrong shape.
+
+        Notes
+        -----
+        The replenishment each tick is::
+
+            spend_delta   = daemon.cumulative_spend   - prev_spend
+            landauer_delta = daemon.cumulative_landauer - prev_landauer
+            ledger.record_replenish(daemon, spend_delta + landauer_delta)
+
+        If the daemon is near ``E_max``, the actual replenishment is
+        capped (``record_replenish`` clips at ``E_max - E``).  If the
+        daemon is near the energy floor, the spend is also capped.
+        Both clippings can produce non-zero drift; this is honest
+        behavior &mdash; the framework is reporting that the configured
+        ``E_max_total`` is too small to absorb the requested
+        computation.
+
+        Landauer debits charged externally between ``step()`` calls
+        (via ``ledger.record_landauer``) are NOT replenished by this
+        method.  The caller is responsible for those.
+
+        Examples
+        --------
+        ::
+
+            ledger = fpm.ConservationLedger(E_max_total=100.0)
+            daemon = ledger.add_daemon(80.0)
+            circ = fpm.Circuit(
+                2, daemon=daemon, ledger=ledger, method="euler",
+            )
+            circ.h(0).cx(0, 1).dephase(gate_power=0.05)
+
+            rho0 = fpm.pure_state([1, 0, 0, 0])
+            traj = circ.run_with_replenishment(rho0, n_steps=20)
+            # ledger.drift() should be ~0 (no external landauer).
+        """
+        if self.daemon is None or self.ledger is None:
+            raise ValueError(
+                "run_with_replenishment requires a daemon and ledger "
+                "attached to the circuit. Construct with "
+                "Circuit(..., daemon=..., ledger=...), or use run() "
+                "for open-system simulations without replenishment."
+            )
+        if n_steps < 0:
+            raise ValueError(f"n_steps must be >= 0, got {n_steps}.")
+
+        rho = np.asarray(rho0, dtype=np.complex128).copy()
+        if rho.shape != (self.dim, self.dim):
+            raise ValueError(
+                f"rho0 shape {rho.shape} does not match "
+                f"({self.dim}, {self.dim})."
+            )
+
+        if not record:
+            for _ in range(n_steps):
+                rho = self._step_with_replenishment(rho)
+            return rho
+
+        traj = np.empty(
+            (n_steps + 1, self.dim, self.dim), dtype=np.complex128
+        )
+        traj[0] = rho
+        for t in range(1, n_steps + 1):
+            rho = self._step_with_replenishment(rho)
+            traj[t] = rho
+        return traj
+
+    def _step_with_replenishment(self, rho: np.ndarray) -> np.ndarray:
+        """Apply one ``step()`` and replenish the daemon by the
+        debited amount (spend + landauer).
+
+        This is the closed-universe conservation primitive: every
+        unit of energy debited from the daemon during the step is
+        returned to it immediately afterward, keeping the ledger
+        identity ``replenish == spend + landauer`` satisfied to
+        within floor/ceiling clipping.
+        """
+        prev_spend = self.daemon.cumulative_spend
+        prev_landauer = self.daemon.cumulative_landauer
+        rho = self.step(rho)
+        spend_delta = self.daemon.cumulative_spend - prev_spend
+        landauer_delta = self.daemon.cumulative_landauer - prev_landauer
+        self.ledger.record_replenish(
+            self.daemon, spend_delta + landauer_delta
+        )
+        return rho
+
     def strang_step(
         self,
         rho: np.ndarray,

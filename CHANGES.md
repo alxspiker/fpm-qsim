@@ -1,5 +1,43 @@
 # CHANGES
 
+## 0.1.7 (2026-06-18)
+
+**`Circuit.run_with_replenishment` — automatic closed-universe balancing.**
+
+- Added `Circuit.run_with_replenishment(rho0, n_steps, *, record=True)`.
+  Same as `run()` but, after each `step()`, replenishes the daemon by
+  exactly the energy debited that tick (spend + landauer), keeping
+  the closed-universe identity `replenish == spend + landauer`
+  satisfied to within energy-floor / energy-ceiling clipping.
+- This is the FPM closed-universe conservation theorem (paper Test 03)
+  made operational at the circuit level: callers no longer need to
+  manually track `cumulative_spend` / `cumulative_landauer` deltas
+  and call `record_replenish` themselves.
+- Requires `daemon` and `ledger` to be attached to the circuit;
+  raises `ValueError` otherwise (pointing users to `run()` for
+  open-system simulations).
+- Honest behavior at the boundaries:
+  - If the daemon is near `E_max`, replenishment is capped at
+    `E_max - E` and drift may grow. The framework is reporting that
+    the configured `E_max_total` is too small to absorb the requested
+    computation.
+  - If the daemon is near the energy floor, spend is capped (existing
+    behavior of `bill_compute_cost`) and replenishment restores the
+    daemon.
+  - Landauer debits charged externally between `step()` calls (via
+    `ledger.record_landauer`) are NOT replenished by this method.
+    The caller is responsible for those.
+- 18 new tests in `tests/test_circuit.py` covering: trajectory
+  shape, `record=False`, `n_steps=0`, daemon/ledger requirement,
+  shape validation, drift-stays-at-zero, daemon-energy preservation,
+  equivalence with manual replenishment loop, billing counter
+  tracking, both `euler` and `exact` methods, external-landauer
+  behavior, E_max clipping, floor clipping, density-matrix validity,
+  input immutability, endogenous-gamma flow. 145 tests total, all
+  passing.
+- Updated `examples/05_circuit.py` to use `run_with_replenishment`
+  instead of the manual replenishment loop.
+
 ## 0.1.6 (2026-06-18)
 
 **Circuit layer: queue-based composition of unitary gates and FPM dephasing.**

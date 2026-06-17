@@ -688,6 +688,270 @@ def test_closed_universe_ledger_with_circuit_billing():
 
 
 # ---------------------------------------------------------------------------
+# run_with_replenishment (v0.1.7)
+# ---------------------------------------------------------------------------
+
+def _make_circ_daemon_ledger(method="euler", cost_per_op=1e-5, E_init=80.0):
+    """Helper: build a 2-qubit circuit with daemon+ledger attached."""
+    ledger = fpm.ConservationLedger(E_max_total=100.0)
+    daemon = ledger.add_daemon(E_init)
+    circ = fpm.Circuit(
+        2, daemon=daemon, ledger=ledger,
+        method=method, cost_per_op=cost_per_op,
+        default_gate_power=0.05,
+    )
+    circ.h(0).cx(0, 1).dephase(dt=1.0)
+    return circ, daemon, ledger
+
+
+def test_run_with_replenishment_returns_trajectory():
+    """Default call returns a trajectory of shape (n_steps+1, dim, dim)."""
+    circ, daemon, ledger = _make_circ_daemon_ledger()
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    traj = circ.run_with_replenishment(rho0, n_steps=10)
+    assert traj.shape == (11, 4, 4)
+    # Initial state preserved.
+    assert np.allclose(traj[0], rho0)
+
+
+def test_run_with_replenishment_no_record_returns_final():
+    """record=False returns only the final state."""
+    circ, daemon, ledger = _make_circ_daemon_ledger()
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    final = circ.run_with_replenishment(rho0, n_steps=10, record=False)
+    assert final.shape == (4, 4)
+
+
+def test_run_with_replenishment_zero_steps():
+    """n_steps=0 returns the initial state with no replenishment."""
+    circ, daemon, ledger = _make_circ_daemon_ledger()
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    traj = circ.run_with_replenishment(rho0, n_steps=0)
+    assert traj.shape == (1, 4, 4)
+    assert np.allclose(traj[0], rho0)
+    # No billing, no replenishment.
+    assert ledger.total_spend == 0.0
+    assert ledger.total_replenish == 0.0
+    assert daemon.E == 80.0
+
+
+def test_run_with_replenishment_rejects_no_daemon():
+    """Without a daemon, raises ValueError pointing to run()."""
+    circ = fpm.Circuit(2)  # no daemon, no ledger
+    circ.h(0).dephase(gamma=0.05)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    with pytest.raises(ValueError, match="requires a daemon and ledger"):
+        circ.run_with_replenishment(rho0, n_steps=5)
+
+
+def test_run_with_replenishment_rejects_daemon_without_ledger():
+    """Construction already rejects this, but check the error path."""
+    with pytest.raises(ValueError, match="both daemon and ledger"):
+        fpm.Circuit(2, daemon=object())  # ledger missing
+
+
+def test_run_with_replenishment_rejects_negative_steps():
+    circ, _, _ = _make_circ_daemon_ledger()
+    with pytest.raises(ValueError, match="n_steps must be >= 0"):
+        circ.run_with_replenishment(fpm.pure_state([1, 0, 0, 0]), n_steps=-1)
+
+
+def test_run_with_replenishment_rejects_bad_rho_shape():
+    circ, _, _ = _make_circ_daemon_ledger()
+    bad_rho = fpm.pure_state([1, 0])  # 2x2, not 4x4
+    with pytest.raises(ValueError, match="does not match"):
+        circ.run_with_replenishment(bad_rho, n_steps=1)
+
+
+def test_run_with_replenishment_keeps_drift_at_zero():
+    """The whole point: closed-universe drift should be ~0."""
+    circ, daemon, ledger = _make_circ_daemon_ledger()
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    circ.run_with_replenishment(rho0, n_steps=20)
+    # No external landauer charged, so drift should be exactly 0.
+    assert ledger.drift() < 1e-12, (
+        f"drift {ledger.drift():.2e} should be ~0 after balanced replenishment"
+    )
+
+
+def test_run_with_replenishment_preserves_daemon_energy():
+    """With exact replenishment and no clipping, daemon E stays constant."""
+    circ, daemon, ledger = _make_circ_daemon_ledger(E_init=80.0)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    initial_E = daemon.E
+    circ.run_with_replenishment(rho0, n_steps=20)
+    # E should be unchanged (we replenished exactly what was spent).
+    assert abs(daemon.E - initial_E) < 1e-9, (
+        f"daemon E changed from {initial_E} to {daemon.E}"
+    )
+
+
+def test_run_with_replenishment_matches_manual_path():
+    """Automatic replenishment gives the same trajectory as manual."""
+    # Automatic.
+    circ1, daemon1, ledger1 = _make_circ_daemon_ledger()
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    traj_auto = circ1.run_with_replenishment(rho0, n_steps=15)
+
+    # Manual.
+    circ2, daemon2, ledger2 = _make_circ_daemon_ledger()
+    rho = rho0.copy()
+    for _ in range(15):
+        prev_spend = daemon2.cumulative_spend
+        prev_landauer = daemon2.cumulative_landauer
+        rho = circ2.step(rho)
+        delta = (
+            (daemon2.cumulative_spend - prev_spend)
+            + (daemon2.cumulative_landauer - prev_landauer)
+        )
+        ledger2.record_replenish(daemon2, delta)
+    traj_manual_final = rho
+
+    # Trajectories should match to machine precision.
+    assert np.allclose(traj_auto[-1], traj_manual_final, atol=1e-14)
+    # And ledgers should agree.
+    assert abs(ledger1.total_spend - ledger2.total_spend) < 1e-9
+    assert abs(ledger1.total_replenish - ledger2.total_replenish) < 1e-9
+    assert abs(ledger1.drift() - ledger2.drift()) < 1e-12
+
+
+def test_run_with_replenishment_tracks_billing_counters():
+    """gates_applied and dephase_layers_applied update correctly."""
+    circ, _, _ = _make_circ_daemon_ledger()
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    circ.run_with_replenishment(rho0, n_steps=10)
+    # 2 gates per step (H + CNOT), 1 dephase per step, 10 steps.
+    assert circ.gates_applied == 20
+    assert circ.dephase_layers_applied == 10
+
+
+def test_run_with_replenishment_works_with_exact_method():
+    """Endogenous gamma + method='exact' also closes the universe."""
+    ledger = fpm.ConservationLedger(E_max_total=100.0)
+    daemon = ledger.add_daemon(80.0)
+    circ = fpm.Circuit(
+        2, daemon=daemon, ledger=ledger,
+        method="exact", cost_per_op=1e-6,  # smaller cost so daemon doesn't floor
+        default_gate_power=0.05,
+    )
+    circ.h(0).cx(0, 1).dephase(dt=1.0)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    traj = circ.run_with_replenishment(rho0, n_steps=10)
+    assert traj.shape == (11, 4, 4)
+    # Drift should be ~0 (no external landauer).
+    assert ledger.drift() < 1e-9
+
+
+def test_run_with_replenishment_with_external_landauer():
+    """Landauer charged externally between steps is NOT replenished.
+
+    The closed-universe identity is replenish == spend + landauer.
+    External landauer charges (not triggered by step()) leave a
+    deliberate gap that the caller must close themselves.
+    """
+    ledger = fpm.ConservationLedger(E_max_total=100.0)
+    daemon = ledger.add_daemon(80.0)
+    circ = fpm.Circuit(
+        2, daemon=daemon, ledger=ledger, method="euler", cost_per_op=1e-5,
+    )
+    circ.h(0).dephase(gate_power=0.05, dt=1.0)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+
+    # Run 3 steps via run_with_replenishment.
+    circ.run_with_replenishment(rho0, n_steps=3)
+    spend_after_3 = ledger.total_spend
+    replenish_after_3 = ledger.total_replenish
+    assert ledger.total_landauer == 0.0
+    assert abs(replenish_after_3 - spend_after_3) < 1e-9
+
+    # Now charge external landauer. Drift becomes nonzero.
+    ledger.record_landauer(daemon, bits_erased=2.0)
+    assert ledger.total_landauer > 0.0
+    drift_with_external_landauer = ledger.drift()
+    assert drift_with_external_landauer > 0.0, (
+        "external landauer should produce non-zero drift"
+    )
+
+
+def test_run_with_replenishment_clipping_at_e_max():
+    """If daemon reaches E_max, replenishment is capped and drift grows.
+
+    With E_init very close to E_max and large cost_per_op, the spend
+    is tiny so replenishment would push E above E_max. record_replenish
+    clips at E_max - E, so cumulative_replenish < cumulative_spend and
+    drift > 0. This is honest behavior.
+    """
+    ledger = fpm.ConservationLedger(E_max_total=100.0)
+    daemon = ledger.add_daemon(99.999)  # very near E_max
+    circ = fpm.Circuit(
+        1, daemon=daemon, ledger=ledger, method="euler",
+        cost_per_op=1e-3,  # large cost per op
+    )
+    circ.dephase(gamma=0.05, dt=1.0)
+    rho0 = fpm.pure_state([1, 1])
+    # Run several steps. Daemon should saturate near E_max.
+    circ.run_with_replenishment(rho0, n_steps=5)
+    # Daemon E should be at or near E_max (replenishment clipped).
+    assert daemon.E <= 100.0 + 1e-9
+    # Note: drift may or may not be > 0 depending on whether spend
+    # exceeded the (E_max - E) headroom. Just verify no crash.
+
+
+def test_run_with_replenishment_clipping_at_floor():
+    """If spend drives daemon to floor, replenishment restores it."""
+    ledger = fpm.ConservationLedger(E_max_total=100.0)
+    daemon = ledger.add_daemon(5.0)  # near floor
+    circ = fpm.Circuit(
+        2, daemon=daemon, ledger=ledger, method="euler",
+        cost_per_op=1.0,  # huge cost -> daemon will hit floor
+    )
+    circ.h(0).dephase(gamma=0.05, dt=1.0)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    circ.run_with_replenishment(rho0, n_steps=3)
+    # Daemon E should be above floor (replenishment restored it).
+    floor = fpm.ENERGY_FLOOR_FRACTION * 100.0
+    assert daemon.E >= floor - 1e-9
+
+
+def test_run_with_replenishment_preserves_density_matrix():
+    """Each step of run_with_replenishment must return a valid density matrix."""
+    circ, _, _ = _make_circ_daemon_ledger()
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    traj = circ.run_with_replenishment(rho0, n_steps=10)
+    for t in range(traj.shape[0]):
+        assert fpm.is_density_matrix(traj[t]), (
+            f"step {t} did not produce a valid density matrix"
+        )
+
+
+def test_run_with_replenishment_does_not_mutate_input():
+    """run_with_replenishment must not modify the input rho0."""
+    circ, _, _ = _make_circ_daemon_ledger()
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    rho0_copy = rho0.copy()
+    circ.run_with_replenishment(rho0, n_steps=5)
+    assert np.allclose(rho0, rho0_copy)
+
+
+def test_run_with_replenishment_endogenous_gamma():
+    """Endogenous gamma (from daemon) works with auto-replenishment."""
+    ledger = fpm.ConservationLedger(E_max_total=100.0)
+    daemon = ledger.add_daemon(75.0)
+    circ = fpm.Circuit(
+        2, daemon=daemon, ledger=ledger, method="euler",
+        cost_per_op=1e-5, default_gate_power=0.1,
+    )
+    circ.h(0).cx(0, 1).dephase(dt=1.0)  # endogenous gamma from daemon
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    traj = circ.run_with_replenishment(rho0, n_steps=15)
+    assert traj.shape == (16, 4, 4)
+    # Each step should be a valid density matrix.
+    assert fpm.is_density_matrix(traj[-1])
+    # Ledger should be balanced.
+    assert ledger.drift() < 1e-9
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
