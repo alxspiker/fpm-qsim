@@ -81,6 +81,8 @@ from .states import (
 from .conservation import (
     DaemonState,
     ConservationLedger,
+    exp_route_cost,
+    bill_exp_route_cost,
 )
 
 __all__ = [
@@ -113,5 +115,7 @@ __all__ = [
     # Closed-universe conservation
     "DaemonState",
     "ConservationLedger",
+    "exp_route_cost",
+    "bill_exp_route_cost",
 ]
 

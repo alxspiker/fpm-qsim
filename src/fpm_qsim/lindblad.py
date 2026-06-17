@@ -24,25 +24,45 @@ The FPM affine map is
 
     c_{t+1} = kappa * c_t + nu_t
 
-with ``kappa in [0, 1]``.  Theorem 3 of the FPM paper identifies one
-particular choice of kappa, ``kappa = 1 - gamma*dt``, with the
-Euler-discretized Lindblad dephasing equation.  This package uses the
-exact continuous-dephasing form
+with ``kappa in [0, 1]``.  Two choices of ``kappa`` are supported,
+with **strict ontological boundaries** between them:
+
+**``method="euler"`` (FPM-native lattice map).**
+
+    kappa = 1 - gamma * dt
+
+This is the literal Theorem 3 identification: the FPM affine map with
+``kappa = 1 - gamma*dt`` is algebraically equivalent to the
+Euler-discretized Lindblad dephasing equation.  Under FPM's discrete
+action principle, this is the physically realizable lattice
+operation.  Per state variable per step, the simulated route cost is
+exactly one multiplication and one addition &mdash; billable to the
+:class:`~fpm_qsim.conservation.ConservationLedger` as
+``bill_compute_cost(daemon, n_multiplies=1, n_adds=1)``.  This
+preserves closed-universe structural coherence.
+
+**``method="exact"`` (legacy continuous-math oracle).**
 
     kappa = exp(-gamma * dt)
 
-which is also a valid FPM affine-map coefficient (still in [0, 1])
-and which makes the integrator **machine-precise** for pure
-dephasing: it reproduces the analytic solution
+This is the exact continuous-dephasing solution &mdash; it reproduces
+the analytic result ``rho(t) = exp(-gamma*t) * (rho_0 - diag(rho_0))
++ diag(rho_0)`` to machine precision (~1e-16), matching Kraus /
+matrix-exponential / QuTiP integrators.
 
-    rho(t) = exp(-gamma*t) * (rho_0 - diag(rho_0)) + diag(rho_0)
-
-to 1e-16, matching Kraus / matrix-exponential / QuTiP integrators
-without the matrix-exponential cost.
-
-The Euler form (``kappa = 1 - gamma*dt``) remains available as a
-private reference implementation for Theorem 3 verification; see
-:mod:`fpm_qsim._reference`.
+**Ontological warning.** Under FPM, ``exp`` is a continuous-math
+idealization.  The simulated system cannot natively evaluate
+``exp(-gamma*dt)``; doing so requires a discrete computational
+construction (Taylor series, CORDIC, Pade approximant) whose
+finite-integer route cost must be paid by the simulated daemons.
+When ``method="exact"`` is used, the host evaluates ``np.exp`` and
+hands the result to the simulated system as a **zero-cost oracle**,
+deliberately breaking the FPM closed-universe ledger.  This is a
+non-physical override used to benchmark FPM against legacy
+continuous quantum mechanics.  To preserve closed-universe
+accounting while using the exact map, callers must explicitly bill
+the simulated construction cost via
+:func:`~fpm_qsim.conservation.bill_exp_route_cost`.
 """
 
 from __future__ import annotations
@@ -76,7 +96,7 @@ def _as_density_matrix(rho: ArrayLike) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# The drop-in dephasing step (exact continuous form)
+# The drop-in dephasing step
 # ---------------------------------------------------------------------------
 
 def lindblad_step(
@@ -84,30 +104,19 @@ def lindblad_step(
     gamma: float,
     dt: float = 1.0,
     *,
+    method: str = "exact",
     bounded: bool = False,
 ) -> np.ndarray:
-    """Advance a density matrix by one exact FPM-affine dephasing step.
+    """Advance a density matrix by one FPM-affine dephasing step.
 
-    Implements
-
-        rho_{t+1} = exp(-gamma*dt) * rho_t
-                    + (1 - exp(-gamma*dt)) * diag(rho_t)
-
-    which is the **exact** solution of the continuous Lindblad
-    dephasing master equation
-
-        d(rho)/dt = -gamma * (rho - diag(rho))
-
-    over one time step ``dt``.  This is the FPM affine map
+    Implements the FPM affine map
 
         c_{t+1} = kappa * c_t + nu_t
 
-    with ``kappa = exp(-gamma*dt)`` (a valid FPM contraction
-    coefficient in ``[0, 1]``) and ``nu`` given by the diagonal
-    restoration.  Theorem 3 of the FPM paper identifies the
-    Euler-discretized form (``kappa = 1 - gamma*dt``) with the
-    FPM map; the exact form here is the same affine map with a
-    strictly better kappa choice.
+    where ``nu`` restores the diagonal (a fixed point of the
+    dephasing map).  The choice of ``kappa`` is governed by
+    ``method`` and carries strict ontological consequences (see
+    module docstring).
 
     Parameters
     ----------
@@ -118,36 +127,58 @@ def lindblad_step(
         Dephasing rate (1/time units).  Must be non-negative.
     dt : float, optional
         Time step.  Default 1.0.  Must be non-negative.
+    method : {"exact", "euler"}, optional
+        Selects the FPM affine-map coefficient:
+
+        * ``"exact"`` (default): ``kappa = exp(-gamma*dt)``.
+          Machine-precise continuous-dephasing solution.  **Oracle
+          break** under FPM &mdash; the host's ``np.exp`` is handed
+          to the simulated system without billing the simulated
+          route cost.  Use for legacy-continuous-QM comparison only.
+          To preserve closed-universe accounting with this method,
+          the caller must explicitly bill the construction cost via
+          :func:`~fpm_qsim.conservation.bill_exp_route_cost`.
+        * ``"euler"``: ``kappa = 1 - gamma*dt``.  The FPM-native
+          lattice map identified by Theorem 3.  Per state variable
+          per step, the simulated route cost is exactly 1 multiply
+          + 1 add &mdash; billable to the
+          :class:`~fpm_qsim.conservation.ConservationLedger`.
+          Requires ``0 <= gamma*dt <= 1`` for the map to remain
+          contractive.
+
     bounded : bool, optional
         If True, clip ``gamma`` at :data:`GAMMA_MAX` before use and
         raise :class:`FalsificationError` if it exceeds the
-        falsification threshold.  Default False (caller is
-        responsible).
+        falsification threshold.  Default False.
 
     Returns
     -------
     ndarray, shape (N, N)
         Next density matrix.  A fresh array; ``rho`` is not modified.
 
+    Raises
+    ------
+    ValueError
+        If ``method`` is not "exact" or "euler", or if ``gamma`` /
+        ``dt`` are negative, or if ``method="euler"`` is used with
+        ``gamma*dt`` outside ``[0, 1]``.
+
     Notes
     -----
     The operation is trace-preserving by construction (the diagonal
     is a fixed point of the affine map).  Positive semidefiniteness
-    is preserved for all ``gamma >= 0`` and ``dt >= 0`` because
-    ``exp(-gamma*dt) in [0, 1]`` always.
-
-    Accuracy: this step reproduces the analytic continuous-dephasing
-    solution to machine precision (max abs error ~ 1e-16).  No
-    Euler-style ``O(dt)`` per-step error.
+    is preserved for all ``gamma >= 0`` and ``dt >= 0`` when
+    ``method="exact"`` (because ``exp(-gamma*dt) in [0, 1]`` always);
+    for ``method="euler"``, positivity is preserved only when
+    ``0 <= gamma*dt <= 1``.
 
     **H != 0 removed in v0.1.3.** Earlier versions accepted an ``H``
     parameter that applied an Euler unitary kick before the dephasing
     contraction.  This reintroduced ``O(dt^2)`` per-step error from
     the Lie-Trotter splitting (because ``[H, L_dephasing] != 0`` in
     general), silently breaking the machine-precision guarantee.
-    The H parameter has been removed from this function; use
-    :func:`unitary_step` to compose Hamiltonian evolution manually
-    with your chosen splitting strategy (Euler, Strang, etc.).
+    Use :func:`unitary_step` to compose Hamiltonian evolution
+    manually with your chosen splitting strategy.
     """
     rho_arr = _as_density_matrix(rho).copy()
 
@@ -161,8 +192,31 @@ def lindblad_step(
     if dt < 0.0:
         raise ValueError(f"dt must be non-negative, got {dt}.")
 
-    # Exact FPM affine-map coefficient for continuous dephasing.
-    kappa = float(np.exp(-gamma * dt))
+    if method == "exact":
+        # Legacy continuous-math oracle.  Host's np.exp is handed to
+        # the simulated system as a zero-cost oracle; the FPM
+        # closed-universe ledger is deliberately broken.  Callers who
+        # need closed-universe accounting must bill the construction
+        # cost separately via bill_exp_route_cost().
+        kappa = float(np.exp(-gamma * dt))
+    elif method == "euler":
+        # FPM-native lattice map.  Per state variable: 1 multiply +
+        # 1 add.  Billable to ConservationLedger as
+        # bill_compute_cost(daemon, n_multiplies=1, n_adds=1).
+        product = gamma * dt
+        if product < 0.0 or product > 1.0:
+            raise ValueError(
+                f"method='euler' requires 0 <= gamma*dt <= 1 for the "
+                f"affine map to remain contractive; got gamma*dt = "
+                f"{product:.6g}. Use method='exact' for unbounded "
+                f"gamma*dt, or reduce dt."
+            )
+        kappa = 1.0 - product
+    else:
+        raise ValueError(
+            f"method must be 'exact' or 'euler'; got {method!r}."
+        )
+
     diag = np.diagonal(rho_arr).copy()
     out = kappa * rho_arr
     # Restore the diagonal to its fixed-point value.
@@ -239,6 +293,7 @@ def simulate(
     dt: float = 1.0,
     n_steps: int = 1,
     *,
+    method: str = "exact",
     bounded: bool = False,
     record: bool = True,
 ):
@@ -257,6 +312,8 @@ def simulate(
         Time step.  Default 1.0.
     n_steps : int, optional
         Number of steps to integrate.  Default 1.
+    method : {"exact", "euler"}, optional
+        See :func:`lindblad_step`.  Default ``"exact"``.
     bounded : bool, optional
         If True, apply the FPM gamma ceiling.  Default False.
     record : bool, optional
@@ -278,13 +335,13 @@ def simulate(
 
     if not record:
         for _ in range(n_steps):
-            rho = lindblad_step(rho, gamma=gamma, dt=dt, bounded=bounded)
+            rho = lindblad_step(rho, gamma=gamma, dt=dt, method=method, bounded=bounded)
         return rho
 
     traj = np.empty((n_steps + 1, N, N), dtype=np.complex128)
     traj[0] = rho
     for t in range(1, n_steps + 1):
-        rho = lindblad_step(rho, gamma=gamma, dt=dt, bounded=bounded)
+        rho = lindblad_step(rho, gamma=gamma, dt=dt, method=method, bounded=bounded)
         traj[t] = rho
     return traj
 

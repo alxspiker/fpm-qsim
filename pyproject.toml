@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fpm-qsim"
-version = "0.1.3"
+version = "0.1.4"
 description = "Drop-in Lindblad dephasing simulator backed by the Finite Possibility Mechanics affine map"
 readme = "README.md"
 license = {text = "MIT"}

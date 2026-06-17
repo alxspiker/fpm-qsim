@@ -131,6 +131,9 @@ def test_public_api_exports():
         "trace_distance",
         "DaemonState",
         "ConservationLedger",
+        # v0.1.4 oracle-cost billing helpers
+        "exp_route_cost",
+        "bill_exp_route_cost",
     ]
     for name in expected:
         assert hasattr(fpm, name), f"missing public name: {name}"

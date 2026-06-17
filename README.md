@@ -100,6 +100,86 @@ rho = lindblad_step(rho, gamma=gamma, dt=0.1)
 
 ---
 
+## Ontological distinction: `method="euler"` vs `method="exact"` (v0.1.4)
+
+The FPM affine map `c_{t+1} = kappa * c_t + nu_t` constrains `kappa ∈ [0, 1]`
+but does not mandate a specific form. v0.1.4 exposes two forms with
+**strict ontological boundaries** between them:
+
+### `method="euler"` — the FPM-native lattice map
+
+```python
+rho_next = fpm.lindblad_step(rho, gamma=0.05, dt=1.0, method="euler")
+```
+
+Uses `kappa = 1 - gamma*dt`. This is the literal Theorem 3
+identification: the FPM affine map with this kappa is algebraically
+equivalent to the Euler-discretized Lindblad dephasing equation.
+
+**Under FPM's discrete action principle, this is the physically
+realizable lattice operation.** Per state variable per step, the
+simulated route cost is exactly **1 multiplication + 1 addition** —
+both finite-integer operations on the discrete lattice. Billable to
+the `ConservationLedger`:
+
+```python
+ledger.bill_compute_cost(daemon, n_multiplies=1, n_adds=1, cost_per_op=1e-5)
+```
+
+This preserves closed-universe structural coherence: every operation
+performed inside the simulated universe is paid for by the daemon
+that performed it. **Use this method when running FPM-aligned
+simulations where the closed-universe ledger must remain balanced.**
+
+Constraint: requires `0 ≤ gamma*dt ≤ 1` for the map to remain
+contractive. Use `method="exact"` for unbounded `gamma*dt`.
+
+### `method="exact"` — the legacy continuous-math oracle
+
+```python
+rho_next = fpm.lindblad_step(rho, gamma=0.05, dt=1.0, method="exact")  # default
+```
+
+Uses `kappa = exp(-gamma*dt)`. Machine-precise continuous-dephasing
+solution: reproduces the analytic result to ~5e-16, matching Kraus /
+matrix-exponential / QuTiP integrators.
+
+**Ontological warning.** Under FPM, `exp` is a continuous-math
+idealization. The simulated system cannot natively evaluate
+`exp(-gamma*dt)`; doing so requires a discrete computational
+construction (Taylor series, CORDIC, Padé approximant) whose
+finite-integer route cost must be paid by the simulated daemons.
+When `method="exact"` is used, the host evaluates `np.exp` and hands
+the result to the simulated system as a **zero-cost oracle**,
+deliberately breaking the FPM closed-universe ledger.
+
+**Use this method only for legacy-continuous-QM comparison**, e.g.
+when you need to benchmark FPM against standard quantum mechanics.
+To preserve closed-universe accounting with this method, the caller
+must explicitly bill the simulated construction cost:
+
+```python
+# After each method="exact" step, bill the simulated Taylor
+# construction of exp(-gamma*dt) via a K-term series.
+# cost_per_op is the energy fraction per simulated op; pick a value
+# appropriate to your simulation's thermodynamic regime.
+fpm.bill_exp_route_cost(ledger, daemon, taylor_order=8, cost_per_op=1e-5)
+```
+
+This bills `(2K multiplies + K additions)` per `exp` evaluation,
+keeping the ledger closed despite the oracle injection. The
+`taylor_order` parameter controls the simulated approximation depth
+(default 8, giving ~1e-15 accuracy for `|gamma*dt| < 1`).
+
+### Default
+
+`method="exact"` is the default for backward compatibility and for
+users who want machine-precision results without thinking about FPM
+ontology. FPM-purist research should explicitly pass
+`method="euler"`.
+
+---
+
 ## What's distinctive about `fpm-qsim`
 
 | Property | fpm-qsim | QuTiP | matrix-exp | Kraus |
@@ -195,9 +275,9 @@ initial state, wall time reported as the minimum of three repeats.
 
 | Symbol | Description |
 |---|---|
-| `lindblad_step(rho, gamma, dt=1.0, *, bounded=False)` | Advance a density matrix by one exact FPM-affine dephasing step. |
+| `lindblad_step(rho, gamma, dt=1.0, *, method="exact", bounded=False)` | **v0.1.4:** Advance a density matrix by one FPM-affine dephasing step. `method="euler"` is the FPM-native lattice map (Theorem 3, billable). `method="exact"` is the legacy continuous-math oracle (machine-precise, breaks closed-universe ledger unless explicitly billed). |
 | `unitary_step(rho, H, dt=1.0)` | Apply one exact Hamiltonian step, `rho -> U rho U^dagger`, using a matrix exponential. |
-| `simulate(rho0, gamma, dt=1.0, n_steps=1, *, bounded=False, record=True)` | Roll out a pure-dephasing trajectory. |
+| `simulate(rho0, gamma, dt=1.0, n_steps=1, *, method="exact", bounded=False, record=True)` | **v0.1.4:** Roll out a pure-dephasing trajectory. `method` is forwarded to `lindblad_step`. |
 
 ### State utilities (`fpm_qsim.states`)
 
@@ -217,6 +297,9 @@ initial state, wall time reported as the minimum of three repeats.
 |---|---|
 | `DaemonState` | Per-daemon bookkeeping (energy, coherence, cumulative flows). |
 | `ConservationLedger` | Closed-universe ledger; tracks `replenish == spend + landauer`. |
+| `ConservationLedger.bill_compute_cost(daemon, n_multiplies, n_adds)` | **v0.1.4.** Bill a daemon for simulated discrete computational work. Use after `method="euler"` steps (1 mul + 1 add per state var) or any other simulated compute. |
+| `exp_route_cost(taylor_order=8)` | **v0.1.4.** Return `(n_multiplies, n_adds)` cost of constructing `exp(-gamma*dt)` via a K-term Taylor series under FPM's discrete action principle. |
+| `bill_exp_route_cost(ledger, daemon, taylor_order=8)` | **v0.1.4.** Convenience wrapper: bill the simulated Taylor construction of one `exp` evaluation. Use after each `method="exact"` step to keep the closed-universe ledger balanced despite the oracle. |
 
 ---
 
@@ -338,6 +421,26 @@ regime where the FPM theorem provides an algebraic correspondence.
 ---
 
 ## Changelog
+
+### 0.1.4 (2026-06-17)
+
+**Ontological boundary between FPM-native and continuous-math maps.**
+
+- Added `method` parameter to `lindblad_step` and `simulate`:
+  - `method="euler"`: FPM-native lattice map (`kappa = 1 - gamma*dt`).
+    The literal Theorem 3 affine map.  Per-step simulated route cost
+    is 1 multiply + 1 add — billable to `ConservationLedger`.
+  - `method="exact"` (default): `kappa = exp(-gamma*dt)`.  Machine-
+    precise continuous-dephasing solution.  Documented as a non-physical
+    oracle break under FPM.  Callers who need closed-universe accounting
+    must explicitly bill the simulated construction cost via
+    `bill_exp_route_cost`.
+- Added `ConservationLedger.bill_compute_cost(daemon, n_multiplies, n_adds)`
+  to debit simulated discrete computational work.
+- Added `exp_route_cost(taylor_order=8)` and `bill_exp_route_cost(ledger,
+  daemon, taylor_order=8)` to bill the simulated Taylor construction
+  of `exp(-gamma*dt)` when using `method="exact"`.
+- 57 tests, all passing.
 
 ### 0.1.3 (2026-06-17)
 

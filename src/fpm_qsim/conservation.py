@@ -22,7 +22,7 @@ floating-point round-off across 300 ticks and 50 daemons.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 
@@ -116,6 +116,99 @@ class ConservationLedger:
         daemon.E = new_E
         daemon.cumulative_landauer += actual_debit
 
+    # -----------------------------------------------------------------
+    # Simulated compute-cost billing (v0.1.4)
+    # -----------------------------------------------------------------
+
+    def bill_compute_cost(
+        self,
+        daemon: DaemonState,
+        n_multiplies: int,
+        n_adds: int,
+        *,
+        cost_per_op: float,
+    ) -> float:
+        """Bill a daemon for simulated discrete computational work.
+
+        Under FPM's discrete action principle, every simulated
+        arithmetic operation (multiply, add) has a finite-integer
+        route cost that must be paid by the simulated daemon's
+        energy budget.  This method debits that cost.
+
+        Use this to bill the work done by ``method="euler"`` in
+        :func:`fpm_qsim.lindblad_step` (1 multiply + 1 add per state
+        variable per step), or to bill any other simulated
+        computational work.
+
+        Parameters
+        ----------
+        daemon : DaemonState
+            The daemon paying the compute cost.
+        n_multiplies : int
+            Number of simulated multiplications.
+        n_adds : int
+            Number of simulated additions.
+        cost_per_op : float, required
+            Energy cost per operation, as a fraction of ``E_max``.
+            For example, ``cost_per_op=1e-4`` means each op costs
+            ``0.01%`` of ``E_max``.  Callers must choose a value
+            appropriate to their simulation's thermodynamic regime.
+
+            Suggested regimes (these are user decisions, not framework
+            mandates):
+
+            * **Landauer minimum** (irreversible bit erasure):
+              ``cost_per_op ~= k_B * T * ln(2) / E_max``.  For
+              typical FPM parameters this is roughly
+              ``ENERGY_FLOOR_FRACTION * ln(2) / N_bit_eq ~= 0.022``
+              for a single-daemon system.  Use this only if the
+              operation truly erases a bit of information.
+            * **Reversible compute** (multiplies, adds on a reversible
+              circuit): typically 3-4 orders of magnitude smaller
+              than Landauer, e.g. ``1e-5`` to ``1e-7``.  Most
+              simulated arithmetic falls here.
+            * **Application-specific**: pick based on the simulated
+              daemon's available energy and the desired compute
+              budget.
+
+        Returns
+        -------
+        float
+            The energy amount actually debited (may be less than
+            requested if the daemon hit the energy floor).
+
+        Notes
+        -----
+        This method enforces closed-universe accounting: every
+        discrete operation performed inside the simulated universe
+        is billed to the daemon that performed it.  This is the FPM
+        counter to the "oracle injection" problem &mdash; without
+        this billing, simulated daemons could perform unbounded
+        computation for free, violating the thermodynamic bridge.
+        """
+        if n_multiplies < 0 or n_adds < 0:
+            raise ValueError(
+                f"n_multiplies and n_adds must be >= 0; got "
+                f"{n_multiplies}, {n_adds}."
+            )
+        n_ops = int(n_multiplies) + int(n_adds)
+        if n_ops == 0:
+            return 0.0
+
+        if cost_per_op < 0:
+            raise ValueError(
+                f"cost_per_op must be >= 0; got {cost_per_op}."
+            )
+
+        debit = n_ops * float(cost_per_op) * daemon.E_max
+        # Floor the daemon's energy.
+        floor = ENERGY_FLOOR_FRACTION * daemon.E_max
+        new_E = max(floor, daemon.E - debit)
+        actual_debit = daemon.E - new_E
+        daemon.E = new_E
+        daemon.cumulative_spend += actual_debit
+        return actual_debit
+
     @property
     def total_spend(self) -> float:
         return sum(d.cumulative_spend for d in self.daemons)
@@ -146,4 +239,109 @@ class ConservationLedger:
         return float(abs(self.total_replenish - rhs) / denom)
 
 
-__all__ = ["DaemonState", "ConservationLedger"]
+# ---------------------------------------------------------------------------
+# Oracle-construction cost helpers (v0.1.4)
+# ---------------------------------------------------------------------------
+
+def exp_route_cost(taylor_order: int = 8) -> tuple:
+    """Return the simulated route cost of constructing ``exp(-gamma*dt)``
+    via a finite Taylor series.
+
+    Under FPM, the simulated system cannot natively evaluate the
+    transcendental ``exp``.  It must construct an approximation via
+    discrete computational routing.  A K-term Taylor series
+
+        exp(-x) ~= sum_{k=0}^{K} (-x)^k / k!
+
+    requires, per evaluation:
+
+        * K multiplications (for the powers of -x)
+        * K additions (for the running sum)
+        * K divisions (for the factorial denominators), which we
+          count as multiplies by precomputed reciprocals
+
+    Total: 2K multiplies + K additions.
+
+    Parameters
+    ----------
+    taylor_order : int, optional
+        Number of terms in the Taylor expansion (K).  Default 8,
+        which gives ~1e-15 accuracy for ``|x| < 1``.
+
+    Returns
+    -------
+    tuple of (int, int)
+        ``(n_multiplies, n_adds)`` for use with
+        :meth:`ConservationLedger.bill_compute_cost`.
+
+    Notes
+    -----
+    Use this to bill the construction cost of ``method="exact"`` in
+    :func:`fpm_qsim.lindblad_step` when closed-universe accounting
+    is required.  Example::
+
+        ledger = ConservationLedger(E_max_total=100.0)
+        d = ledger.add_daemon(50.0)
+
+        # One step of method='exact' (oracle break).
+        rho = lindblad_step(rho, gamma=0.05, dt=1.0, method='exact')
+
+        # Bill the simulated Taylor construction of exp(-gamma*dt).
+        n_mul, n_add = exp_route_cost(taylor_order=8)
+        ledger.bill_compute_cost(d, n_multiplies=n_mul, n_adds=n_add)
+    """
+    if taylor_order < 0:
+        raise ValueError(
+            f"taylor_order must be >= 0; got {taylor_order}."
+        )
+    K = int(taylor_order)
+    # K power multiplications + K reciprocal multiplications + K additions.
+    return (2 * K, K)
+
+
+def bill_exp_route_cost(
+    ledger: "ConservationLedger",
+    daemon: "DaemonState",
+    *,
+    taylor_order: int = 8,
+    cost_per_op: float,
+) -> float:
+    """Bill the simulated route cost of one ``exp`` evaluation.
+
+    Convenience wrapper combining :func:`exp_route_cost` with
+    :meth:`ConservationLedger.bill_compute_cost`.  Use this after
+    each ``method="exact"`` step to keep the closed-universe ledger
+    balanced despite the continuous-math oracle.
+
+    Parameters
+    ----------
+    ledger : ConservationLedger
+        The ledger to bill.
+    daemon : DaemonState
+        The daemon paying for the simulated construction.
+    taylor_order : int, optional
+        Number of Taylor terms assumed for the construction.
+        Default 8.
+    cost_per_op : float, required
+        Energy cost per simulated operation, as a fraction of
+        ``E_max``.  See
+        :meth:`ConservationLedger.bill_compute_cost` for guidance
+        on choosing this value.
+
+    Returns
+    -------
+    float
+        The energy amount debited.
+    """
+    n_mul, n_add = exp_route_cost(taylor_order=taylor_order)
+    return ledger.bill_compute_cost(
+        daemon, n_multiplies=n_mul, n_adds=n_add, cost_per_op=cost_per_op,
+    )
+
+
+__all__ = [
+    "DaemonState",
+    "ConservationLedger",
+    "exp_route_cost",
+    "bill_exp_route_cost",
+]
