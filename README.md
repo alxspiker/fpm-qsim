@@ -36,6 +36,16 @@ competitive pure-dephasing simulation, a NumPy-only pure-dephasing
 path, the FPM falsifiability ceiling, and the conservation-ledger
 primitives needed by downstream FPM research.
 
+As of v0.1.5, `gamma` no longer has to be a free external parameter:
+`gamma_from_energy` can derive dephasing from a daemon's energy budget,
+gate power, and local load.  This is the FPM-specific noise model:
+high-power gates, higher load, or energy-starved daemons decohere
+faster.
+
+As of v0.1.6, the `Circuit` layer composes unitary gates with FPM
+dephasing layers under a single closed-universe ledger, with automatic
+billing of every simulated operation's route cost.
+
 For speed, the important distinction is structural vs constant-factor:
 pure dephasing can be implemented in `O(N^2)` per step by any
 dephasing-aware method.  `fpm-qsim` is competitive with that
@@ -180,6 +190,170 @@ ontology. FPM-purist research should explicitly pass
 
 ---
 
+## Endogenous noise: deriving `gamma` from energy (v0.1.5)
+
+Most Lindblad tools ask the caller to provide a dephasing rate:
+
+```python
+rho = fpm.lindblad_step(rho, gamma=0.05, dt=1.0)
+```
+
+That path still works.  The FPM-distinctive path derives `gamma` from
+the daemon doing the work:
+
+```python
+ledger = fpm.ConservationLedger(E_max_total=100.0)
+daemon = ledger.add_daemon(E_init=75.0)
+
+gamma = fpm.gamma_from_energy(
+    daemon,
+    gate_power=0.20,
+    load=0.10,
+    dt=1.0,
+)
+rho = fpm.lindblad_step(rho, gamma=gamma, dt=1.0, method="euler")
+```
+
+For convenience, `lindblad_step` and `simulate` can derive `gamma`
+directly:
+
+```python
+rho = fpm.lindblad_step(
+    rho,
+    dt=1.0,
+    daemon=daemon,
+    gate_power=0.20,
+    load=0.10,
+    method="euler",
+)
+```
+
+The contraction model is
+
+```
+kappa_t = C_N * (1 + B_t)^(-3/4)
+gamma_t = (1 - kappa_t) / dt
+```
+
+with the package's minimal gate-noise load
+
+```
+B_t = load + gate_power / energy_fraction
+```
+
+So dephasing increases when:
+
+- gate power increases,
+- local load increases,
+- daemon energy fraction decreases.
+
+Use this when you want noise to be endogenous to the simulated FPM
+ledger rather than supplied as an external phenomenological rate.
+
+---
+
+## Circuit layer (v0.1.6)
+
+`Circuit` composes unitary gates with FPM dephasing layers under a
+single closed-universe ledger.  It removes the boilerplate of
+manually composing `unitary_step` and `lindblad_step` (and the
+associated ledger billing) for the common case of "apply these gates,
+then dephase, repeat N times".
+
+The circuit is a **queue of unitary gates and dephasing layers**.
+Each call to `step()` applies the full queue once.  `run(rho0, n_steps)`
+repeats the queue `n_steps` times and returns the trajectory.
+
+### Minimal usage
+
+```python
+import fpm_qsim as fpm
+
+circ = fpm.Circuit(2)
+circ.h(0).cx(0, 1).dephase(gamma=0.05)
+
+rho0 = fpm.pure_state([1, 0, 0, 0])  # |00><00|
+traj = circ.run(rho0, n_steps=10)
+# traj.shape == (11, 4, 4)
+```
+
+### FPM-aligned usage (closed-universe billing)
+
+```python
+ledger = fpm.ConservationLedger(E_max_total=100.0)
+daemon = ledger.add_daemon(80.0)
+
+circ = fpm.Circuit(
+    2,
+    daemon=daemon,
+    ledger=ledger,
+    method="euler",            # FPM-native lattice map
+    bounded=True,              # raise on gamma > 32
+    default_gate_power=0.05,   # endogenous-noise input
+    cost_per_op=1e-5,          # energy fraction per simulated op
+)
+circ.h(0).cx(0, 1).dephase(dt=1.0)
+
+rho = fpm.pure_state([1, 0, 0, 0])
+for _ in range(20):
+    prev_spend = daemon.cumulative_spend
+    rho = circ.step(rho)
+    spent = daemon.cumulative_spend - prev_spend
+    ledger.record_replenish(daemon, spent)  # closed-universe identity
+```
+
+### Available gates
+
+| Method | Gate |
+|---|---|
+| `h(i)`, `x(i)`, `y(i)`, `z(i)` | Single-qubit Pauli + Hadamard |
+| `s(i)`, `t(i)` | Phase gates |
+| `u(theta, phi, lam, i)` | General single-qubit unitary |
+| `cx(control, target)` | CNOT |
+| `cz(i, j)` | Controlled-Z |
+| `swap(i, j)` | SWAP |
+| `apply_unitary(U, targets)` | Arbitrary k-qubit unitary (k ≤ 10) |
+| `apply_unitary_full(U_full)` | Pre-expanded full-Hilbert-space unitary (any n) |
+| `dephase(gamma=None, *, dt=1.0, gate_power=None, load=None)` | FPM dephasing layer |
+
+Gates are applied via **direct conjugation** `U @ rho @ U^dagger`
+(standard quantum-circuit convention), not as Hamiltonian time
+evolution.  For Hamiltonian dynamics, use `strang_step(rho, H, gamma, dt)`.
+
+### Ontological billing
+
+When `daemon` and `ledger` are attached, every operation bills the
+closed-universe ledger for its simulated construction cost:
+
+| Operation | Billed as |
+|---|---|
+| Unitary gate | `N^2` scalar `exp` constructions (one per matrix element), each via K-term Taylor series |
+| `dephase(method="euler")` | 1 mul + 1 add per off-diagonal state var (`N*(N-1)` ops) — literal Theorem 3 lattice operation |
+| `dephase(method="exact")` | 1 scalar `exp` per off-diagonal state var, each via K-term Taylor — oracle break, billed explicitly |
+
+Billing is opt-in: if `ledger` is `None` or `daemon` is `None`, no
+billing happens and the circuit behaves as a pure state-stepper.
+
+### Strang splitting for Hamiltonian + dephasing
+
+```python
+H = np.array([[1, 1], [1, -1]], dtype=complex) * 0.5
+rho = fpm.pure_state([1, 1])
+circ = fpm.Circuit(1, daemon=daemon, ledger=ledger, method="euler")
+rho = circ.strang_step(rho, H, gamma=0.05, dt=0.5)
+# Implements: U(dt/2) -> dephase(dt) -> U(dt/2)  [O(dt^3) per-step error]
+```
+
+### Honest scope
+
+The circuit layer implements only the gate set with a clean FPM
+correspondence.  General dissipative channels (amplitude damping,
+depolarizing, etc.) remain out of scope: they have no FPM
+correspondence theorem.  Only the pure-dephasing affine map of
+Theorem 3 is wired in via `dephase`.
+
+---
+
 ## What's distinctive about `fpm-qsim`
 
 | Property | fpm-qsim | QuTiP | matrix-exp | Kraus |
@@ -190,7 +364,9 @@ ontology. FPM-purist research should explicitly pass
 | Falsifiability ceiling | **gamma_max = 31.87** | --- | --- | --- |
 | Theorem-verified affine map | **Theorem 3** | --- | --- | --- |
 | Closed-universe ledger | **Yes** | --- | --- | --- |
-| Combined unitary + dephasing | **Explicit `unitary_step` + user-chosen splitting** | Built in | Built in | Channel-specific |
+| Endogenous gamma from energy | **Yes (v0.1.5)** | --- | --- | --- |
+| Circuit layer with billing | **Yes (v0.1.6)** | --- | --- | --- |
+| Combined unitary + dephasing | **`Circuit` queue or `strang_step`** | Built in | Built in | Channel-specific |
 
 The only Lindblad integrator in the Python ecosystem with a
 **built-in falsifiability ceiling**: observations with `gamma > 32.0`
@@ -264,8 +440,9 @@ initial state, wall time reported as the minimum of three repeats.
 | `ENERGY_FLOOR_FRACTION = 0.03138...` | v5.0 zero-energy floor (Test 07). |
 | `ISOTROPIC_WEIGHT_LIMIT = 1/3` | Spectral-gap isotropic limit weight (Test 04). |
 | `kappa_from_gamma(gamma, dt=1.0)` | Euler-form contraction coefficient `1 - gamma*dt` (Theorem 3 form). |
-| `kappa_exact(gamma, dt=1.0)` | Exact continuous-form contraction coefficient `exp(-gamma*dt)`. **This is what `lindblad_step` uses.** |
+| `kappa_exact(gamma, dt=1.0)` | Exact continuous-form contraction coefficient `exp(-gamma*dt)`. Used by `lindblad_step` when `method="exact"`. |
 | `gamma_from_kappa(kappa, dt=1.0)` | Inverse of `kappa_from_gamma`. |
+| `gamma_from_energy(daemon, gate_power, load=None, dt=1.0)` | **v0.1.5.** Derive endogenous dephasing from daemon energy, gate power, and local load. |
 | `fpm_affine_step(c, kappa, nu=0.0)` | One tick of the affine map `c_{t+1} = kappa*c_t + nu`. |
 | `fpm_affine_trajectory(c0, kappa, nu=0.0, n_steps=1)` | Closed-form rollout of the affine map. |
 | `bounded_gamma(gamma_raw, gamma_max=GAMMA_MAX)` | Clip a rate to the ceiling; raise if it would falsify. |
@@ -275,9 +452,9 @@ initial state, wall time reported as the minimum of three repeats.
 
 | Symbol | Description |
 |---|---|
-| `lindblad_step(rho, gamma, dt=1.0, *, method="exact", bounded=False)` | **v0.1.4:** Advance a density matrix by one FPM-affine dephasing step. `method="euler"` is the FPM-native lattice map (Theorem 3, billable). `method="exact"` is the legacy continuous-math oracle (machine-precise, breaks closed-universe ledger unless explicitly billed). |
+| `lindblad_step(rho, gamma=None, dt=1.0, *, daemon=None, gate_power=None, load=None, method="exact", bounded=False)` | Advance a density matrix by one FPM-affine dephasing step. Pass explicit `gamma` for legacy use, or pass `daemon` + `gate_power` to derive endogenous gamma. |
 | `unitary_step(rho, H, dt=1.0)` | Apply one exact Hamiltonian step, `rho -> U rho U^dagger`, using a matrix exponential. |
-| `simulate(rho0, gamma, dt=1.0, n_steps=1, *, method="exact", bounded=False, record=True)` | **v0.1.4:** Roll out a pure-dephasing trajectory. `method` is forwarded to `lindblad_step`. |
+| `simulate(rho0, gamma=None, dt=1.0, n_steps=1, *, daemon=None, gate_power=None, load=None, method="exact", bounded=False, record=True)` | Roll out a pure-dephasing trajectory. `method` and energy-derived gamma inputs are forwarded to `lindblad_step`. |
 
 ### State utilities (`fpm_qsim.states`)
 
@@ -295,11 +472,30 @@ initial state, wall time reported as the minimum of three repeats.
 
 | Symbol | Description |
 |---|---|
-| `DaemonState` | Per-daemon bookkeeping (energy, coherence, cumulative flows). |
+| `DaemonState` | Per-daemon bookkeeping (energy, coherence, local `load`, cumulative flows). |
 | `ConservationLedger` | Closed-universe ledger; tracks `replenish == spend + landauer`. |
 | `ConservationLedger.bill_compute_cost(daemon, n_multiplies, n_adds)` | **v0.1.4.** Bill a daemon for simulated discrete computational work. Use after `method="euler"` steps (1 mul + 1 add per state var) or any other simulated compute. |
 | `exp_route_cost(taylor_order=8)` | **v0.1.4.** Return `(n_multiplies, n_adds)` cost of constructing `exp(-gamma*dt)` via a K-term Taylor series under FPM's discrete action principle. |
 | `bill_exp_route_cost(ledger, daemon, taylor_order=8)` | **v0.1.4.** Convenience wrapper: bill the simulated Taylor construction of one `exp` evaluation. Use after each `method="exact"` step to keep the closed-universe ledger balanced despite the oracle. |
+
+### Circuit layer (`fpm_qsim.circuit`) — v0.1.6
+
+| Symbol | Description |
+|---|---|
+| `Circuit(n_qubits, *, daemon=None, ledger=None, method="exact", bounded=False, default_load=None, default_gate_power=None, cost_per_op=1e-5, taylor_order=8)` | Queue-based circuit composing unitary gates with FPM dephasing. Auto-bills the ledger when `daemon` and `ledger` are attached. |
+| `Circuit.h(i)`, `.x(i)`, `.y(i)`, `.z(i)`, `.s(i)`, `.t(i)` | Single-qubit gates (fluent, return self). |
+| `Circuit.u(theta, phi, lam, i)` | General single-qubit unitary. |
+| `Circuit.cx(control, target)`, `.cz(i, j)`, `.swap(i, j)` | Two-qubit gates. |
+| `Circuit.apply_unitary(U, targets)` | Append an arbitrary k-qubit unitary (k ≤ 10). |
+| `Circuit.apply_unitary_full(U_full)` | Append a pre-expanded full-Hilbert-space unitary (any n). |
+| `Circuit.dephase(gamma=None, *, dt=1.0, gate_power=None, load=None)` | Append an FPM dephasing layer. Endogenous gamma derived from daemon if `gamma` is omitted. |
+| `Circuit.step(rho)` | Apply the full queued sequence once. Returns the next density matrix. |
+| `Circuit.run(rho0, n_steps=1, *, record=True)` | Apply `step()` `n_steps` times. Returns trajectory of shape `(n_steps+1, dim, dim)` if `record=True`, else final state. |
+| `Circuit.strang_step(rho, H, gamma, dt, *, gate_power=None, load=None)` | One Strang-split round: `U(dt/2) + dephase(dt) + U(dt/2)`. Uses `expm(-i H dt/2)` for the half-steps. Bills three operations. |
+| `Circuit.reset()` | Clear the queue (does not reset billing counters). |
+| `Circuit.reset_stats()` | Reset billing counters (does not clear the queue). |
+| `Circuit.operations` | List of human-readable descriptions of queued ops. |
+| `Circuit.gates_applied`, `.dephase_layers_applied` | Cumulative billing counters. |
 
 ---
 
@@ -421,6 +617,31 @@ regime where the FPM theorem provides an algebraic correspondence.
 ---
 
 ## Changelog
+
+### 0.1.6 (2026-06-18)
+
+**Circuit layer: queue-based composition of unitary gates and FPM dephasing.**
+
+- Added `Circuit` class for composing unitary gates (`h`, `x`, `y`, `z`,
+  `s`, `t`, `cx`, `cz`, `swap`, `u`, `apply_unitary`, `apply_unitary_full`)
+  with FPM dephasing layers under a single closed-universe ledger.
+- Gates applied via direct conjugation `U @ rho @ U^dagger` (standard
+  circuit convention). For Hamiltonian time evolution, use
+  `strang_step(rho, H, gamma, dt)`.
+- Auto-bills the ledger when `daemon` and `ledger` are attached:
+  unitaries as `N^2` scalar `exp` Taylor constructions, dephasing per
+  the circuit's `method` (1 mul + 1 add per state var for `euler`;
+  scalar `exp` per state var for `exact`).
+- 60 new tests in `tests/test_circuit.py`. 127 tests total, all passing.
+- Added `examples/05_circuit.py`.
+
+### 0.1.5 (2026-06-17)
+
+- Added `gamma_from_energy(daemon, gate_power, load=None, dt=1.0)`,
+  deriving dephasing from daemon energy, gate power, and local load.
+- `lindblad_step` and `simulate` now accept either explicit `gamma`
+  or `daemon` + `gate_power` for endogenous FPM noise.
+- Kept raw `gamma=...` as the legacy explicit-rate path.
 
 ### 0.1.4 (2026-06-17)
 

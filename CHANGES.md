@@ -1,5 +1,66 @@
 # CHANGES
 
+## 0.1.6 (2026-06-18)
+
+**Circuit layer: queue-based composition of unitary gates and FPM dephasing.**
+
+- Added `Circuit` class (`fpm_qsim.circuit`) — a fluent queue builder
+  for composing unitary gates with FPM dephasing layers under a single
+  closed-universe ledger.
+- Gate set: `h`, `x`, `y`, `z`, `s`, `t`, `cx`, `cz`, `swap`, and
+  generic `u(theta, phi, lam, i)`. Plus `apply_unitary(U, targets)` for
+  arbitrary k-qubit unitaries and `apply_unitary_full(U_full)` for
+  pre-expanded operators (supports >10 qubits).
+- Gates are applied via direct conjugation `U @ rho @ U^dagger`
+  (standard quantum-circuit convention), not as Hamiltonian time
+  evolution. This is the correct semantics for circuit gates and
+  avoids the matrix-exp cost at application time.
+- `dephase(gamma=None, *, dt=1.0, gate_power=None, load=None)` appends
+  a dephasing layer. Supports both explicit gamma and endogenous
+  gamma derived from the attached daemon (forwarded to
+  `lindblad_step`).
+- `step(rho)` applies the full queued sequence once. `run(rho0,
+  n_steps, record=True)` repeats and returns the trajectory.
+- `strang_step(rho, H, gamma, dt, ...)` provides the standard
+  second-order Strang splitting (`U(dt/2) + dephase(dt) + U(dt/2)`)
+  for Hamiltonian + dephasing dynamics. Uses `unitary_step` with
+  `expm(-i H dt/2)` for the half-steps.
+- **Closed-universe billing** (when `daemon` and `ledger` are
+  attached): every gate and dephasing layer bills the ledger for its
+  simulated construction cost:
+  - Unitary gates: `N^2` scalar `exp` constructions (one per matrix
+    element), each via a K-term Taylor series. `N = 2^n_qubits`.
+  - Dephasing (`method="euler"`): 1 multiply + 1 addition per
+    off-diagonal state variable (`N*(N-1)` total). The literal
+    Theorem 3 lattice operation.
+  - Dephasing (`method="exact"`): 1 scalar `exp` per off-diagonal
+    state variable, each billed via K-term Taylor series. Oracle
+    break, billed explicitly.
+- Falsifiability ceiling is enforced when `bounded=True`: endogenous
+  or explicit gammas exceeding 32.0 raise `FalsificationError`.
+- 60 new tests in `tests/test_circuit.py` covering gate semantics,
+  dephasing decay, billing math, Strang splitting, endogenous gamma,
+  and falsification. 127 tests total, all passing.
+- Added `examples/05_circuit.py` demonstrating Bell state preparation
+  with endogenous dephasing and closed-universe billing.
+
+## 0.1.5 (2026-06-17)
+
+**Endogenous dephasing from daemon energy and gate load.**
+
+- Added `gamma_from_energy(daemon, gate_power, load=None, dt=1.0)`.
+  This derives `gamma` from the FPM contraction form
+  `kappa_t = C_N * (1 + B_t)^(-3/4)` and
+  `gamma_t = (1 - kappa_t) / dt`.
+- The minimal gate-noise model uses
+  `B_t = load + gate_power / energy_fraction`, so higher gate power,
+  higher load, or lower daemon energy increases dephasing.
+- Added `load` to `DaemonState` for storing the daemon's local load.
+- `lindblad_step` and `simulate` now accept either explicit `gamma`
+  or `daemon` + `gate_power` for first-class endogenous FPM noise.
+- Exposed `gamma_from_energy` in the top-level public API.
+- Kept raw `gamma=...` as the legacy explicit-rate path.
+
 ## 0.1.4 (2026-06-17)
 
 **Ontological boundary between FPM-native and continuous-math maps.**

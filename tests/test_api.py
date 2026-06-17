@@ -119,6 +119,7 @@ def test_public_api_exports():
         "kappa_from_gamma",
         "kappa_exact",
         "gamma_from_kappa",
+        "gamma_from_energy",
         "bounded_gamma",
         "FalsificationError",
         "GAMMA_MAX",

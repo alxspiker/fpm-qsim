@@ -27,6 +27,8 @@ representations on off-diagonal density-matrix elements over
 
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -143,6 +145,96 @@ def gamma_from_kappa(kappa: float, dt: float = 1.0) -> float:
     if dt <= 0.0:
         raise ValueError(f"dt must be positive, got {dt}.")
     return (1.0 - float(kappa)) / float(dt)
+
+
+def gamma_from_energy(
+    daemon,
+    gate_power: float,
+    *,
+    load: Optional[float] = None,
+    dt: float = 1.0,
+    C_N: float = 1.0,
+    bounded: bool = True,
+) -> float:
+    """Derive an endogenous dephasing rate from daemon energy and load.
+
+    Operationalizes the FPM contraction ansatz
+
+        kappa_t = C_N * (1 + B_t)^(-3/4)
+        gamma_t = (1 - kappa_t) / dt
+
+    with a minimal gate-noise load model
+
+        B_t = load + gate_power / energy_fraction
+
+    so larger gate power, larger baryonic/load terms, or lower daemon
+    energy all increase dephasing.  This makes ``gamma`` endogenous to
+    the simulated daemon rather than a free external parameter.
+
+    Parameters
+    ----------
+    daemon : object
+        Daemon-like object with an ``energy_fraction`` property, or
+        ``E`` and ``E_max`` attributes.  ``DaemonState`` satisfies this
+        contract.
+    gate_power : float
+        Non-negative gate load applied during this step.
+    load : float, optional
+        Additional non-negative baryonic/load term.  If omitted, reads
+        ``daemon.load`` or ``daemon.baryonic_load`` when present,
+        otherwise uses ``0.0``.
+    dt : float, optional
+        Positive timestep for converting ``kappa`` to ``gamma``.
+    C_N : float, optional
+        Normalization coefficient in ``[0, 1]``.  Default ``1.0``.
+    bounded : bool, optional
+        If True, apply the FPM falsification ceiling via
+        :func:`bounded_gamma`.
+
+    Returns
+    -------
+    float
+        Endogenous dephasing rate suitable for ``lindblad_step``.
+    """
+    gate_power = float(gate_power)
+    if gate_power < 0.0:
+        raise ValueError(f"gate_power must be non-negative, got {gate_power}.")
+    if dt <= 0.0:
+        raise ValueError(f"dt must be positive, got {dt}.")
+    C_N = float(C_N)
+    if not 0.0 <= C_N <= 1.0:
+        raise ValueError(f"C_N must be in [0, 1], got {C_N}.")
+
+    if load is None:
+        load = getattr(daemon, "load", getattr(daemon, "baryonic_load", 0.0))
+    load = float(load)
+    if load < 0.0:
+        raise ValueError(f"load must be non-negative, got {load}.")
+
+    energy_fraction = getattr(daemon, "energy_fraction", None)
+    if energy_fraction is None:
+        E = getattr(daemon, "E", None)
+        E_max = getattr(daemon, "E_max", None)
+        if E is None or E_max is None:
+            raise TypeError(
+                "daemon must provide energy_fraction or E and E_max attributes."
+            )
+        energy_fraction = float(E) / float(E_max) if float(E_max) > 0 else 0.0
+    else:
+        energy_fraction = float(energy_fraction)
+    if energy_fraction < 0.0:
+        raise ValueError(
+            f"daemon energy_fraction must be non-negative, got {energy_fraction}."
+        )
+
+    effective_energy = max(
+        energy_fraction, ENERGY_FLOOR_FRACTION, np.finfo(float).eps,
+    )
+    effective_load = load + gate_power / effective_energy
+    kappa = C_N * (1.0 + effective_load) ** (-0.75)
+    kappa = min(1.0, max(0.0, float(kappa)))
+    gamma = gamma_from_kappa(kappa, dt=dt)
+    return float(bounded_gamma(gamma)) if bounded else gamma
 
 
 def fpm_affine_step(c, kappa, nu=0.0):
@@ -286,6 +378,7 @@ __all__ = [
     "kappa_from_gamma",
     "kappa_exact",
     "gamma_from_kappa",
+    "gamma_from_energy",
     "fpm_affine_step",
     "fpm_affine_trajectory",
     "bounded_gamma",

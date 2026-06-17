@@ -42,6 +42,7 @@ class DaemonState:
     E_max: float
     E: float
     coherence: complex = 0.0 + 0.0j
+    load: float = 0.0
     cumulative_spend: float = 0.0
     cumulative_replenish: float = 0.0
     cumulative_landauer: float = 0.0

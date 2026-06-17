@@ -60,6 +60,7 @@ from .core import (
     kappa_from_gamma,
     kappa_exact,
     gamma_from_kappa,
+    gamma_from_energy,
     fpm_affine_step,
     fpm_affine_trajectory,
     bounded_gamma,
@@ -84,6 +85,7 @@ from .conservation import (
     exp_route_cost,
     bill_exp_route_cost,
 )
+from .circuit import Circuit
 
 __all__ = [
     # Version
@@ -97,6 +99,7 @@ __all__ = [
     "kappa_from_gamma",
     "kappa_exact",
     "gamma_from_kappa",
+    "gamma_from_energy",
     "fpm_affine_step",
     "fpm_affine_trajectory",
     "bounded_gamma",
@@ -117,5 +120,6 @@ __all__ = [
     "ConservationLedger",
     "exp_route_cost",
     "bill_exp_route_cost",
+    # Circuit layer (v0.1.6)
+    "Circuit",
 ]
-
