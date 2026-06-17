@@ -84,7 +84,6 @@ def lindblad_step(
     gamma: float,
     dt: float = 1.0,
     *,
-    H: Optional[ArrayLike] = None,
     bounded: bool = False,
 ) -> np.ndarray:
     """Advance a density matrix by one exact FPM-affine dephasing step.
@@ -119,13 +118,6 @@ def lindblad_step(
         Dephasing rate (1/time units).  Must be non-negative.
     dt : float, optional
         Time step.  Default 1.0.  Must be non-negative.
-    H : array_like, optional
-        Hamiltonian.  If provided, a single Euler step of
-        ``-i*[H, rho]/hbar`` is applied BEFORE the dephasing
-        contraction.  This extends the integrator beyond pure
-        dephasing; the exact FPM correspondence is proven only for
-        H = 0, so callers using H != 0 should validate against a
-        reference integrator.
     bounded : bool, optional
         If True, clip ``gamma`` at :data:`GAMMA_MAX` before use and
         raise :class:`FalsificationError` if it exceeds the
@@ -147,6 +139,15 @@ def lindblad_step(
     Accuracy: this step reproduces the analytic continuous-dephasing
     solution to machine precision (max abs error ~ 1e-16).  No
     Euler-style ``O(dt)`` per-step error.
+
+    **H != 0 removed in v0.1.3.** Earlier versions accepted an ``H``
+    parameter that applied an Euler unitary kick before the dephasing
+    contraction.  This reintroduced ``O(dt^2)`` per-step error from
+    the Lie-Trotter splitting (because ``[H, L_dephasing] != 0`` in
+    general), silently breaking the machine-precision guarantee.
+    The H parameter has been removed from this function; use
+    :func:`unitary_step` to compose Hamiltonian evolution manually
+    with your chosen splitting strategy (Euler, Strang, etc.).
     """
     rho_arr = _as_density_matrix(rho).copy()
 
@@ -160,17 +161,6 @@ def lindblad_step(
     if dt < 0.0:
         raise ValueError(f"dt must be non-negative, got {dt}.")
 
-    # Optional unitary kick (extension; not part of the exact theorem).
-    if H is not None:
-        H_arr = np.asarray(H, dtype=np.complex128)
-        if H_arr.shape != rho_arr.shape:
-            raise ValueError(
-                f"H shape {H_arr.shape} does not match rho shape "
-                f"{rho_arr.shape}."
-            )
-        # Euler step of -i [H, rho] dt   (hbar = 1)
-        rho_arr += -1j * (H_arr @ rho_arr - rho_arr @ H_arr) * dt
-
     # Exact FPM affine-map coefficient for continuous dephasing.
     kappa = float(np.exp(-gamma * dt))
     diag = np.diagonal(rho_arr).copy()
@@ -180,13 +170,75 @@ def lindblad_step(
     return out
 
 
+def unitary_step(
+    rho: ArrayLike,
+    H: ArrayLike,
+    dt: float = 1.0,
+) -> np.ndarray:
+    """Apply a single exact unitary (Hamiltonian) step.
+
+    Implements
+
+        rho_{t+1} = U @ rho_t @ U^dagger,    U = exp(-i H dt)
+
+    which is the exact solution of the von Neumann equation
+
+        d(rho)/dt = -i [H, rho]
+
+    over one time step ``dt``.  Uses a matrix exponential, so it is
+    machine-precise for any Hermitian ``H`` and any ``dt``.
+
+    This function exists so callers can compose Hamiltonian evolution
+    with dephasing (:func:`lindblad_step`) using their chosen
+    splitting strategy.  For pure dephasing, just use
+    :func:`lindblad_step` directly.  For combined unitary + dephasing
+    dynamics, use a Strang splitting:
+
+        rho = unitary_step(rho, H, dt/2)
+        rho = lindblad_step(rho, gamma, dt)
+        rho = unitary_step(rho, H, dt/2)
+
+    This gives ``O(dt^3)`` per-step error, much better than the
+    naive Euler splitting (``O(dt^2)``).
+
+    Parameters
+    ----------
+    rho : array_like, shape (N, N)
+        Current density matrix.
+    H : array_like, shape (N, N)
+        Hermitian Hamiltonian.
+    dt : float, optional
+        Time step.  Default 1.0.
+
+    Returns
+    -------
+    ndarray, shape (N, N)
+        Next density matrix.  A fresh array; ``rho`` is not modified.
+
+    Notes
+    -----
+    Requires SciPy for the matrix exponential.  If SciPy is not
+    installed, raises ``ImportError``.
+    """
+    from scipy.linalg import expm
+
+    rho_arr = _as_density_matrix(rho)
+    H_arr = np.asarray(H, dtype=np.complex128)
+    if H_arr.shape != rho_arr.shape:
+        raise ValueError(
+            f"H shape {H_arr.shape} does not match rho shape "
+            f"{rho_arr.shape}."
+        )
+    U = expm(-1j * H_arr * float(dt))
+    return U @ rho_arr @ U.conj().T
+
+
 def simulate(
     rho0: ArrayLike,
     gamma: float,
     dt: float = 1.0,
     n_steps: int = 1,
     *,
-    H: Optional[ArrayLike] = None,
     bounded: bool = False,
     record: bool = True,
 ):
@@ -205,8 +257,6 @@ def simulate(
         Time step.  Default 1.0.
     n_steps : int, optional
         Number of steps to integrate.  Default 1.
-    H : array_like, optional
-        Optional Hamiltonian.  See :func:`lindblad_step`.
     bounded : bool, optional
         If True, apply the FPM gamma ceiling.  Default False.
     record : bool, optional
@@ -228,18 +278,19 @@ def simulate(
 
     if not record:
         for _ in range(n_steps):
-            rho = lindblad_step(rho, gamma=gamma, dt=dt, H=H, bounded=bounded)
+            rho = lindblad_step(rho, gamma=gamma, dt=dt, bounded=bounded)
         return rho
 
     traj = np.empty((n_steps + 1, N, N), dtype=np.complex128)
     traj[0] = rho
     for t in range(1, n_steps + 1):
-        rho = lindblad_step(rho, gamma=gamma, dt=dt, H=H, bounded=bounded)
+        rho = lindblad_step(rho, gamma=gamma, dt=dt, bounded=bounded)
         traj[t] = rho
     return traj
 
 
 __all__ = [
     "lindblad_step",
+    "unitary_step",
     "simulate",
 ]

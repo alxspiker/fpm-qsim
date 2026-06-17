@@ -1,5 +1,14 @@
 # CHANGES
 
+## 0.1.3 (2026-06-17)
+
+- Removed the `H` parameter from `lindblad_step`; Hamiltonian
+  evolution now uses explicit `unitary_step` composition.
+- Added `unitary_step` to the public API for exact Hamiltonian steps.
+- Updated README benchmark framing: competitive pure-dephasing
+  performance, not unique speed dominance.
+- Added benchmark speed and accuracy tables to the README.
+
 ## 0.1.2 (2026-06-17)
 
 - Clarified the PyPI installation command in the README.

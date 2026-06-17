@@ -66,6 +66,7 @@ from .core import (
 )
 from .lindblad import (
     lindblad_step,
+    unitary_step,
     simulate,
 )
 from .states import (
@@ -99,6 +100,7 @@ __all__ = [
     "bounded_gamma",
     # Lindblad-equivalent API
     "lindblad_step",
+    "unitary_step",
     "simulate",
     # State utilities
     "basis_state",

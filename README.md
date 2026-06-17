@@ -27,15 +27,20 @@ analytic continuous-dephasing solution
 rho(t) = exp(-gamma*t) * (rho_0 - diag(rho_0)) + diag(rho_0)
 ```
 
-to **1.1 × 10⁻¹⁶** (verified in `tests/test_lindblad_correspondence.py`),
-matching Kraus / matrix-exponential / QuTiP integrators without their
-cost.
+to machine precision (about `5e-16` in the benchmark), matching
+Kraus and matrix-exponential references for pure dephasing.
 
-Because the FPM map is a single vectorized affine update — no matrix
-exponentials, no Kraus decomposition — it scales as `O(N²)` per step
-on an `N × N` density matrix, vs `O(N⁴)` for matrix-exponential
-methods.  On 4-qubit (16 × 16) systems this is a ~20× speedup; on
-larger systems the gap widens further.
+The honest positioning is not "uniquely fastest."  `fpm-qsim` is the
+reference implementation of the FPM affine-map primitives: it provides
+competitive pure-dephasing simulation, a NumPy-only pure-dephasing
+path, the FPM falsifiability ceiling, and the conservation-ledger
+primitives needed by downstream FPM research.
+
+For speed, the important distinction is structural vs constant-factor:
+pure dephasing can be implemented in `O(N^2)` per step by any
+dephasing-aware method.  `fpm-qsim` is competitive with that
+specialized baseline and much faster than a general matrix-exponential
+Liouvillian on the same pure-dephasing problem.
 
 ---
 
@@ -55,8 +60,8 @@ cd fpm-qsim
 pip install -e .
 ```
 
-**Requirements:** Python ≥ 3.9, NumPy ≥ 1.22.  SciPy is optional
-(for tests).
+**Requirements:** Python ≥ 3.9, NumPy ≥ 1.22.  SciPy is optional for
+tests and for `unitary_step`.
 
 ---
 
@@ -85,8 +90,8 @@ If you have an existing Lindblad dephasing loop, swap one import:
 
 ```python
 # Before
-# from your_qsim_library import lindblad_step
-# rho = lindblad_step(rho, H=None, c_ops=[sqrt(gamma) * sigma_z], dt=0.1)
+# from your_qsim_library import dephasing_step
+# rho = dephasing_step(rho, c_ops=[sqrt(gamma / 2) * sigma_z], dt=0.1)
 
 # After
 from fpm_qsim import lindblad_step
@@ -99,18 +104,72 @@ rho = lindblad_step(rho, gamma=gamma, dt=0.1)
 
 | Property | fpm-qsim | QuTiP | matrix-exp | Kraus |
 |---|---|---|---|---|
-| Dephasing accuracy | **1.1 × 10⁻¹⁶** | 1.1 × 10⁻¹⁶ | 1.1 × 10⁻¹⁶ | 1.1 × 10⁻¹⁶ |
-| Per-step cost on `N×N` | **O(N²)** | O(N²)–O(N³) | O(N⁴) | O(N²) |
-| Dependencies | **NumPy only** | SciPy + Cython + … | SciPy | NumPy |
-| Falsifiability ceiling | **γ_max = 31.87** | — | — | — |
-| Theorem-verified affine map | **Theorem 3** | — | — | — |
-| Closed-universe ledger | **Yes** | — | — | — |
+| Dephasing accuracy | **~5e-16** | ~2e-7 in the benchmark | ~5e-16 | ~5e-16 |
+| Pure-dephasing speed | **Competitive with dephasing-specialized O(N^2)** | General solver overhead | General or specialized | Single-qubit baseline |
+| Dependencies | **NumPy for pure dephasing; SciPy only for `unitary_step`** | SciPy + Cython + ... | SciPy for general matrix-exp | NumPy |
+| Falsifiability ceiling | **gamma_max = 31.87** | --- | --- | --- |
+| Theorem-verified affine map | **Theorem 3** | --- | --- | --- |
+| Closed-universe ledger | **Yes** | --- | --- | --- |
+| Combined unitary + dephasing | **Explicit `unitary_step` + user-chosen splitting** | Built in | Built in | Channel-specific |
 
 The only Lindblad integrator in the Python ecosystem with a
-**built-in falsifiability ceiling**: observations with `γ > 32.0`
+**built-in falsifiability ceiling**: observations with `gamma > 32.0`
 raise `FalsificationError` rather than silently producing unphysical
 results.  This is the FPM finite-lag-ceiling theorem (paper Test 09)
 made operational.
+
+Equally important: this package is where the FPM theorem is made
+operational.  `kappa_exact`, `kappa_from_gamma`, `bounded_gamma`,
+`ConservationLedger`, and `DaemonState` are not generic convenience
+functions; they are the public primitives for building FPM-aligned
+simulators, auditors, and falsification tests.
+
+---
+
+## Benchmarks
+
+The benchmark corrected three earlier overclaims:
+
+- The large speedup against general matrix-exp is real, but structural:
+  it comes from exploiting pure-dephasing structure, which any
+  dephasing-aware implementation can also exploit.
+- With the gamma convention corrected, fpm-qsim, matrix-exp, and Kraus
+  all match the analytic pure-dephasing solution at machine precision.
+- The old `H` parameter on `lindblad_step` was removed because it used
+  a naive Euler unitary kick.  Use `unitary_step` and compose the
+  splitting explicitly.
+
+Speed results for 1,000 pure-dephasing steps:
+
+| Qubits | Dim | fpm-qsim | general matrix-exp | dephasing-specialized matrix-exp | scipy `solve_ivp` | QuTiP | Kraus |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2 | 3.38 ms | 1.88 ms | 1.18 ms | 13.28 ms | 10.44 ms | 5.47 ms |
+| 2 | 4 | 3.31 ms | 1.98 ms | 1.45 ms | 13.76 ms | --- | --- |
+| 3 | 8 | 3.39 ms | 15.03 ms | 1.86 ms | 28.58 ms | --- | --- |
+| 4 | 16 | 4.03 ms | 136.08 ms | 3.19 ms | 147.54 ms | --- | --- |
+| 5 | 32 | 7.28 ms | --- | 6.19 ms | --- | --- | --- |
+| 6 | 64 | 17.30 ms | --- | 18.34 ms | --- | --- | --- |
+
+At 4 qubits, `fpm-qsim` is about `34x` faster than the general
+matrix-exp baseline, but about `25%` slower than a matrix-exp baseline
+that is specialized for pure dephasing.  The fair claim is that
+`fpm-qsim` is competitive with the best dephasing-specialized approach
+while also carrying the FPM research API and falsifiability checks.
+
+Accuracy results, measured as max absolute error vs the analytic
+solution after 1,000 steps:
+
+| Qubits | Dim | fpm-qsim | general matrix-exp | dephasing-specialized matrix-exp | scipy `solve_ivp` | QuTiP | Kraus |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2 | 4.6e-16 | 4.6e-16 | 4.6e-16 | 4.00e-12 | 2.04e-07 | 4.6e-16 |
+| 2 | 4 | 3.5e-16 | 3.5e-16 | 3.5e-16 | 1.57e-12 | --- | --- |
+| 3 | 8 | 3.4e-16 | 3.4e-16 | 3.4e-16 | 1.33e-12 | --- | --- |
+| 4 | 16 | 1.9e-16 | 1.9e-16 | 1.9e-16 | 1.16e-12 | --- | --- |
+| 5 | 32 | 9.7e-17 | --- | 9.7e-17 | --- | --- | --- |
+| 6 | 64 | 7.4e-17 | --- | 7.4e-17 | --- | --- | --- |
+
+Benchmark configuration: `gamma = 0.02`, `dt = 1.0`, Haar-random pure
+initial state, wall time reported as the minimum of three repeats.
 
 ---
 
@@ -136,8 +195,9 @@ made operational.
 
 | Symbol | Description |
 |---|---|
-| `lindblad_step(rho, gamma, dt=1.0, *, H=None, bounded=False)` | Advance a density matrix by one exact FPM-affine dephasing step. |
-| `simulate(rho0, gamma, dt=1.0, n_steps=1, *, H=None, bounded=False, record=True)` | Roll out a full trajectory. |
+| `lindblad_step(rho, gamma, dt=1.0, *, bounded=False)` | Advance a density matrix by one exact FPM-affine dephasing step. |
+| `unitary_step(rho, H, dt=1.0)` | Apply one exact Hamiltonian step, `rho -> U rho U^dagger`, using a matrix exponential. |
+| `simulate(rho0, gamma, dt=1.0, n_steps=1, *, bounded=False, record=True)` | Roll out a pure-dephasing trajectory. |
 
 ### State utilities (`fpm_qsim.states`)
 
@@ -195,9 +255,29 @@ in `tests/test_lindblad_correspondence.py::test_theorem3_lindblad_correspondence
 The exact form (`kappa = exp(-gamma*dt)`) is **also** a valid FPM
 affine-map coefficient (in `[0, 1]` for all `gamma, dt >= 0`) and is
 what the public `lindblad_step` uses.  It reproduces the analytic
-continuous-dephasing solution to 1.1 × 10⁻¹⁶, matching Kraus /
-matrix-exp / QuTiP integrators.  The Euler form remains available
-in `fpm_qsim._reference.euler_lindblad_step` for Theorem 3 research.
+continuous-dephasing solution to machine precision, matching Kraus and
+matrix-exp references.  The Euler form remains available in
+`fpm_qsim._reference.euler_lindblad_step` for Theorem 3 research.
+
+### Hamiltonian evolution
+
+`lindblad_step` is deliberately scoped to pure dephasing.  Earlier
+versions accepted an `H` parameter and applied a naive Euler unitary
+kick before dephasing.  That silently reintroduced splitting error for
+`H != 0` and broke the machine-precision guarantee.
+
+For combined unitary + dephasing dynamics, compose the exact
+Hamiltonian step explicitly.  The recommended Strang splitting is:
+
+```python
+rho = fpm.unitary_step(rho, H, dt / 2)
+rho = fpm.lindblad_step(rho, gamma=gamma, dt=dt)
+rho = fpm.unitary_step(rho, H, dt / 2)
+```
+
+This has `O(dt^3)` per-step splitting error.  `unitary_step` requires
+SciPy for the matrix exponential; the pure-dephasing path remains
+NumPy-only.
 
 ### The falsifiable ceiling
 
@@ -243,12 +323,10 @@ pytest -v
 This package implements pure dephasing channels with `H = 0`, the
 regime where the FPM theorem provides an algebraic correspondence.
 
-- The `H` parameter on `lindblad_step` extends the integrator to
-  non-zero Hamiltonians by composing an Euler unitary kick with the
-  dephasing contraction.  This is a standard composition, but the
-  exact algebraic correspondence to a closed-form affine map is
-  proven only for `H = 0`.  Callers using `H != 0` should validate
-  against a reference integrator for their specific use case.
+- `lindblad_step` does not accept `H`.  For `H != 0`, compose
+  `unitary_step` and `lindblad_step` explicitly, preferably with
+  Strang splitting.  Accuracy then depends on the caller's chosen
+  splitting strategy.
 - General Lindblad channels (amplitude damping, depolarizing, etc.)
   are not directly equivalent to the FPM affine map.  Future
   versions may extend the correspondence.
@@ -260,6 +338,14 @@ regime where the FPM theorem provides an algebraic correspondence.
 ---
 
 ## Changelog
+
+### 0.1.3 (2026-06-17)
+
+- Reframed the README around the audit-corrected benchmark:
+  competitive pure-dephasing performance, not unique speed dominance.
+- Added benchmark tables for speed and accuracy.
+- Documented the removal of `H` from `lindblad_step` and the explicit
+  `unitary_step` composition path for `H != 0`.
 
 ### 0.1.2 (2026-06-17)
 

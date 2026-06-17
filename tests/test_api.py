@@ -77,19 +77,30 @@ def test_simulate_no_record():
     assert final.shape == (2, 2)
 
 
-def test_with_hamiltonian_extension():
-    """H != 0 path runs; results should differ from H = 0."""
-    rho0 = fpm.pure_state([1, 0])
+def test_unitary_step():
+    """unitary_step applies an exact Hamiltonian step."""
+    rho0 = fpm.pure_state([1, 0])  # |0><0|
     H = np.array([[0, 1], [1, 0]], dtype=complex)  # sigma_x
 
-    rho_no_H = fpm.lindblad_step(rho0, gamma=0.0, dt=0.1)
-    rho_with_H = fpm.lindblad_step(rho0, gamma=0.0, dt=0.1, H=H)
+    # With H = sigma_x and small dt, the state should rotate.
+    # |0> -> cos(dt)|0> + i*sin(dt)|1>, so |rho_01| = sin(dt)*cos(dt).
+    import math
+    dt = 0.1
+    rho_next = fpm.unitary_step(rho0, H, dt=dt)
+    expected_01 = math.sin(dt) * math.cos(dt)
+    assert abs(rho_next[0, 1].imag - expected_01) < 1e-14, (
+        f"unitary_step gave rho_01 = {rho_next[0, 1]}, "
+        f"expected imaginary part {expected_01}"
+    )
 
-    # With H = sigma_x and gamma = 0, the state should rotate.
-    # rho0 = |0><0| -> after small dt, off-diagonal should grow.
-    assert abs(rho_with_H[0, 1]) > 0, "Hamiltonian did not affect the state"
-    # Without H, nothing changes.
-    assert np.allclose(rho_no_H, rho0)
+
+def test_lindblad_step_no_H_param():
+    """v0.1.3: lindblad_step no longer accepts H parameter."""
+    rho = fpm.pure_state([1, 0])
+    H = np.array([[0, 1], [1, 0]], dtype=complex)
+    with pytest.raises(TypeError):
+        # H is no longer a valid keyword argument.
+        fpm.lindblad_step(rho, gamma=0.1, dt=1.0, H=H)
 
 
 def test_version_string():
@@ -101,6 +112,7 @@ def test_public_api_exports():
     """Spot-check that the public names exist."""
     expected = [
         "lindblad_step",
+        "unitary_step",
         "simulate",
         "fpm_affine_step",
         "fpm_affine_trajectory",
