@@ -41,6 +41,8 @@ larger systems the gap widens further.
 
 ## Installation
 
+Install from PyPI:
+
 ```bash
 pip install fpm-qsim
 ```
@@ -258,6 +260,10 @@ regime where the FPM theorem provides an algebraic correspondence.
 ---
 
 ## Changelog
+
+### 0.1.2 (2026-06-17)
+
+- Clarified the PyPI installation command in the README.
 
 ### 0.1.1 (2026-06-17)
 

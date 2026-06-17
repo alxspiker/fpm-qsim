@@ -1,5 +1,9 @@
 # CHANGES
 
+## 0.1.2 (2026-06-17)
+
+- Clarified the PyPI installation command in the README.
+
 ## 0.1.1 (2026-06-17)
 
 **Breaking change:** `lindblad_step` now uses the exact continuous

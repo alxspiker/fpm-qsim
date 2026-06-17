@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fpm-qsim"
-version = "0.1.1"
+version = "0.1.2"
 description = "Drop-in Lindblad dephasing simulator backed by the Finite Possibility Mechanics affine map"
 readme = "README.md"
 license = {text = "MIT"}
@@ -66,7 +66,6 @@ Homepage = "https://github.com/alxspiker/fpm-qsim"
 Documentation = "https://github.com/alxspiker/fpm-qsim#readme"
 Repository = "https://github.com/alxspiker/fpm-qsim"
 Issues = "https://github.com/alxspiker/fpm-qsim/issues"
-Paper = "Finite Possibility Mechanics: A Unified Information-Theoretic Framework (2026)"
 
 [tool.setuptools.packages.find]
 where = ["src"]
