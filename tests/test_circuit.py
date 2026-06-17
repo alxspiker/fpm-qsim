@@ -48,9 +48,9 @@ def test_circuit_construction_with_daemon_and_ledger():
 def test_circuit_construction_rejects_daemon_without_ledger():
     ledger = fpm.ConservationLedger(E_max_total=100.0)
     daemon = ledger.add_daemon(80.0)
-    with pytest.raises(ValueError, match="both daemon and ledger"):
+    with pytest.raises(ValueError, match="daemons together with ledger"):
         fpm.Circuit(2, daemon=daemon)
-    with pytest.raises(ValueError, match="both daemon and ledger"):
+    with pytest.raises(ValueError, match="daemons together with ledger"):
         fpm.Circuit(2, ledger=ledger)
 
 
@@ -740,13 +740,13 @@ def test_run_with_replenishment_rejects_no_daemon():
     circ = fpm.Circuit(2)  # no daemon, no ledger
     circ.h(0).dephase(gamma=0.05)
     rho0 = fpm.pure_state([1, 0, 0, 0])
-    with pytest.raises(ValueError, match="requires a daemon and ledger"):
+    with pytest.raises(ValueError, match="requires a daemon"):
         circ.run_with_replenishment(rho0, n_steps=5)
 
 
 def test_run_with_replenishment_rejects_daemon_without_ledger():
     """Construction already rejects this, but check the error path."""
-    with pytest.raises(ValueError, match="both daemon and ledger"):
+    with pytest.raises(ValueError, match="daemons together with ledger"):
         fpm.Circuit(2, daemon=object())  # ledger missing
 
 
@@ -963,3 +963,487 @@ def test_circuit_in_public_api():
 
 def test_circuit_appears_in_all():
     assert "Circuit" in fpm.__all__
+
+
+# ---------------------------------------------------------------------------
+# Multi-daemon mode (v0.1.8)
+# ---------------------------------------------------------------------------
+
+def _make_multi_daemon_circ(
+    n_qubits=2, energies=(80.0, 60.0), method="euler",
+    cost_per_op=1e-5, default_gate_power=0.05,
+):
+    """Helper: build a multi-daemon circuit with per-qubit daemons."""
+    E_max = 100.0
+    ledger = fpm.ConservationLedger(E_max_total=E_max)
+    daemons = [ledger.add_daemon(e) for e in energies]
+    circ = fpm.Circuit(
+        n_qubits, daemons=daemons, ledger=ledger,
+        method=method, cost_per_op=cost_per_op,
+        default_gate_power=default_gate_power,
+    )
+    return circ, daemons, ledger
+
+
+# --- Construction ---
+
+def test_multi_daemon_construction():
+    circ, daemons, ledger = _make_multi_daemon_circ()
+    assert circ.is_multi_daemon is True
+    assert circ.daemon is None
+    assert len(circ.daemons) == 2
+    assert circ.all_daemons == list(daemons)
+    assert circ.n_qubits == 2
+
+
+def test_multi_daemon_rejects_daemon_and_daemons_both():
+    ledger = fpm.ConservationLedger(E_max_total=100.0)
+    d = ledger.add_daemon(80.0)
+    with pytest.raises(ValueError, match="not both"):
+        fpm.Circuit(2, daemon=d, daemons=[d, d], ledger=ledger)
+
+
+def test_multi_daemon_rejects_wrong_length():
+    ledger = fpm.ConservationLedger(E_max_total=100.0)
+    d0 = ledger.add_daemon(80.0)
+    d1 = ledger.add_daemon(60.0)
+    with pytest.raises(ValueError, match="does not match"):
+        fpm.Circuit(3, daemons=[d0, d1], ledger=ledger)
+
+
+def test_multi_daemon_rejects_non_daemonstate():
+    ledger = fpm.ConservationLedger(E_max_total=100.0)
+    with pytest.raises(TypeError, match="must be a DaemonState"):
+        fpm.Circuit(2, daemons=[1, 2], ledger=ledger)
+
+
+def test_multi_daemon_daemon_for_qubit():
+    circ, daemons, _ = _make_multi_daemon_circ()
+    assert circ._daemon_for_qubit(0) is daemons[0]
+    assert circ._daemon_for_qubit(1) is daemons[1]
+
+
+def test_multi_daemon_daemons_for_targets():
+    circ, daemons, _ = _make_multi_daemon_circ()
+    result = circ._daemons_for_targets([0, 1])
+    assert result == [daemons[0], daemons[1]]
+    # Single target
+    assert circ._daemons_for_targets([1]) == [daemons[1]]
+
+
+# --- Backward compat: single-daemon mode still works ---
+
+def test_single_daemon_is_multi_daemon_false():
+    ledger = fpm.ConservationLedger(E_max_total=100.0)
+    daemon = ledger.add_daemon(80.0)
+    circ = fpm.Circuit(2, daemon=daemon, ledger=ledger)
+    assert circ.is_multi_daemon is False
+    assert circ.daemons is None
+    assert circ.all_daemons == [daemon]
+
+
+# --- Billing: unitary gates split across target daemons ---
+
+def test_multi_daemon_single_qubit_gate_bills_only_that_daemon():
+    """H on qubit 0 bills only daemons[0]."""
+    circ, daemons, ledger = _make_multi_daemon_circ(cost_per_op=1e-4)
+    circ.h(0)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    circ.step(rho0)
+    # Only d0 should have been billed.
+    assert daemons[0].cumulative_spend > 0
+    assert daemons[1].cumulative_spend == 0.0
+
+
+def test_multi_daemon_two_qubit_gate_splits_billing():
+    """CNOT(0,1) splits the bill 50/50 between d0 and d1."""
+    circ, daemons, ledger = _make_multi_daemon_circ(cost_per_op=1e-4)
+    circ.cx(0, 1)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    circ.step(rho0)
+    # Both should be billed, and equally.
+    assert daemons[0].cumulative_spend > 0
+    assert daemons[1].cumulative_spend > 0
+    assert abs(daemons[0].cumulative_spend - daemons[1].cumulative_spend) < 1e-9
+
+
+def test_multi_daemon_apply_unitary_full_bills_all_daemons():
+    """apply_unitary_full bills all daemons equally."""
+    circ, daemons, ledger = _make_multi_daemon_circ(cost_per_op=1e-4)
+    U = np.eye(4, dtype=complex)  # trivial
+    circ.apply_unitary_full(U)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    circ.step(rho0)
+    # Both daemons billed equally.
+    assert daemons[0].cumulative_spend > 0
+    assert daemons[1].cumulative_spend > 0
+    assert abs(daemons[0].cumulative_spend - daemons[1].cumulative_spend) < 1e-9
+
+
+# --- Billing: dephasing layers ---
+
+def test_multi_daemon_dephase_bills_all_daemons():
+    """dephase() with no targets bills all daemons."""
+    circ, daemons, ledger = _make_multi_daemon_circ(cost_per_op=1e-4)
+    circ.dephase(gamma=0.05, dt=1.0)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    circ.step(rho0)
+    assert daemons[0].cumulative_spend > 0
+    assert daemons[1].cumulative_spend > 0
+
+
+def test_multi_daemon_dephase_with_targets_bills_only_named():
+    """dephase(targets=[0]) bills only d0."""
+    circ, daemons, ledger = _make_multi_daemon_circ(cost_per_op=1e-4)
+    circ.dephase(gamma=0.05, dt=1.0, targets=[0])
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    circ.step(rho0)
+    assert daemons[0].cumulative_spend > 0
+    assert daemons[1].cumulative_spend == 0.0
+
+
+# --- Per-qubit endogenous gamma ---
+
+def test_multi_daemon_per_qubit_gamma_depends_on_daemon_energy():
+    """Energy-rich daemon produces lower gamma (slower dephasing)."""
+    # d0 energy-rich (E=90), d1 energy-poor (E=10)
+    circ, daemons, ledger = _make_multi_daemon_circ(
+        energies=(90.0, 10.0), cost_per_op=1e-6,
+        default_gate_power=0.1,
+    )
+    circ.dephase(dt=1.0)
+    rho0 = fpm.pure_state([1, 1, 1, 1])
+    rho1 = circ.step(rho0)
+    # rho_01: q0 same, q1 differs.  d1 is poor -> fast decay -> smaller.
+    # rho_02: q0 differs, q1 same.  d0 is rich -> slow decay -> larger.
+    assert abs(rho1[0, 1]) < abs(rho1[0, 2]), (
+        f"|rho_01|={abs(rho1[0, 1])} should be < |rho_02|={abs(rho1[0, 2])} "
+        f"(q1 poor decays faster)"
+    )
+
+
+def test_multi_daemon_per_qubit_gamma_matches_direct_calculation():
+    """Per-qubit dephasing matches manual gamma_from_energy + kappa.
+
+    Uses cost_per_op=0 so billing doesn't change daemon energy during
+    the step (which would make the post-step gamma computation differ
+    from the in-step gamma computation).
+    """
+    circ, daemons, ledger = _make_multi_daemon_circ(
+        energies=(90.0, 10.0), method="euler",
+        cost_per_op=0.0,  # no billing -> daemon E unchanged
+        default_gate_power=0.1,
+    )
+    circ.dephase(dt=1.0)
+    rho0 = fpm.pure_state([1, 1, 1, 1])
+
+    # Compute gamma BEFORE step (matching what the circuit will use).
+    gamma0 = fpm.gamma_from_energy(daemons[0], gate_power=0.1, dt=1.0, bounded=False)
+    gamma1 = fpm.gamma_from_energy(daemons[1], gate_power=0.1, dt=1.0, bounded=False)
+    kappa0 = 1.0 - gamma0 * 1.0  # euler
+    kappa1 = 1.0 - gamma1 * 1.0
+
+    rho1 = circ.step(rho0)
+
+    # Manual: apply dephasing per qubit with its own gamma.
+    rho_manual = rho0.copy()
+    n = 4
+    indices = np.arange(n)
+    bit0 = (indices >> 1) & 1  # MSB = qubit 0
+    bit1 = (indices >> 0) & 1  # LSB = qubit 1
+    mask0 = bit0[:, None] != bit0[None, :]
+    mask1 = bit1[:, None] != bit1[None, :]
+    rho_manual = rho_manual * np.where(mask0, kappa0, 1.0)
+    rho_manual = rho_manual * np.where(mask1, kappa1, 1.0)
+
+    assert np.allclose(rho1, rho_manual, atol=1e-14), (
+        f"per-qubit dephasing does not match manual calculation\n"
+        f"diff: {np.max(np.abs(rho1 - rho_manual))}"
+    )
+
+
+def test_multi_daemon_dephase_preserves_diagonal():
+    circ, daemons, ledger = _make_multi_daemon_circ()
+    circ.dephase(dt=1.0)
+    rho0 = fpm.pure_state([1, 1, 1, 1])
+    rho1 = circ.step(rho0)
+    # Diagonal must be preserved.
+    for i in range(4):
+        assert abs(rho1[i, i] - rho0[i, i]) < 1e-14
+
+
+def test_multi_daemon_dephase_preserves_density_matrix():
+    circ, daemons, ledger = _make_multi_daemon_circ()
+    circ.h(0).cx(0, 1).dephase(dt=1.0)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    for _ in range(10):
+        rho0 = circ.step(rho0)
+        assert fpm.is_density_matrix(rho0)
+
+
+# --- Targeted dephasing ---
+
+def test_multi_daemon_targeted_dephase_leaves_other_qubit_untouched():
+    """dephase(targets=[0]) leaves q1's coherences untouched."""
+    circ, daemons, ledger = _make_multi_daemon_circ(cost_per_op=1e-6)
+    circ.dephase(dt=1.0, targets=[0])
+    rho0 = fpm.pure_state([1, 1, 1, 1])
+    rho1 = circ.step(rho0)
+    # rho_01 (q0 same, q1 differs): should be UNCHANGED.
+    assert abs(abs(rho1[0, 1]) - abs(rho0[0, 1])) < 1e-12, (
+        f"rho_01 should be unchanged (q1 not targeted): "
+        f"before={abs(rho0[0, 1])}, after={abs(rho1[0, 1])}"
+    )
+    # rho_02 (q0 differs): should DECAY.
+    assert abs(rho1[0, 2]) < abs(rho0[0, 2]), (
+        f"rho_02 should decay (q0 targeted): "
+        f"before={abs(rho0[0, 2])}, after={abs(rho1[0, 2])}"
+    )
+
+
+def test_multi_daemon_dephase_targets_validation():
+    circ, _, _ = _make_multi_daemon_circ()
+    with pytest.raises(ValueError, match="distinct"):
+        circ.dephase(gamma=0.05, targets=[0, 0])
+    with pytest.raises(ValueError, match="out of range"):
+        circ.dephase(gamma=0.05, targets=[5])
+
+
+def test_multi_daemon_dephase_targets_recorded_in_operations():
+    circ, _, _ = _make_multi_daemon_circ()
+    circ.dephase(gamma=0.05, targets=[0, 1])
+    ops = circ.operations
+    assert "qubits=[0, 1]" in ops[0]
+
+
+# --- Closed-universe balancing in multi-daemon mode ---
+
+def test_multi_daemon_run_with_replenishment_zero_drift():
+    """Network-wide drift should be ~0 with balanced replenishment."""
+    circ, daemons, ledger = _make_multi_daemon_circ()
+    circ.h(0).cx(0, 1).dephase(dt=1.0)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    circ.run_with_replenishment(rho0, n_steps=20)
+    assert ledger.drift() < 1e-12, (
+        f"network drift {ledger.drift():.2e} should be ~0"
+    )
+
+
+def test_multi_daemon_run_with_replenishment_preserves_each_daemon_energy():
+    """Each daemon's E should be preserved by balanced replenishment."""
+    circ, daemons, ledger = _make_multi_daemon_circ(
+        energies=(80.0, 60.0)
+    )
+    initial_E = [d.E for d in daemons]
+    circ.h(0).cx(0, 1).dephase(dt=1.0)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    circ.run_with_replenishment(rho0, n_steps=20)
+    for i, d in enumerate(daemons):
+        assert abs(d.E - initial_E[i]) < 1e-9, (
+            f"daemon {i} E changed from {initial_E[i]} to {d.E}"
+        )
+
+
+def test_multi_daemon_run_with_replenishment_bills_both_daemons():
+    """Both daemons should have been billed during the run."""
+    circ, daemons, ledger = _make_multi_daemon_circ()
+    circ.h(0).cx(0, 1).dephase(dt=1.0)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    circ.run_with_replenishment(rho0, n_steps=10)
+    assert daemons[0].cumulative_spend > 0
+    assert daemons[1].cumulative_spend > 0
+
+
+def test_multi_daemon_run_with_replenishment_matches_manual():
+    """Auto-replenishment matches manual per-daemon replenishment."""
+    # Automatic.
+    circ1, daemons1, ledger1 = _make_multi_daemon_circ(
+        energies=(80.0, 60.0)
+    )
+    circ1.h(0).cx(0, 1).dephase(dt=1.0)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    traj_auto = circ1.run_with_replenishment(rho0, n_steps=15)
+
+    # Manual.
+    circ2, daemons2, ledger2 = _make_multi_daemon_circ(
+        energies=(80.0, 60.0)
+    )
+    circ2.h(0).cx(0, 1).dephase(dt=1.0)
+    rho = rho0.copy()
+    for _ in range(15):
+        prev = {d.index: (d.cumulative_spend, d.cumulative_landauer) for d in daemons2}
+        rho = circ2.step(rho)
+        for d in daemons2:
+            prev_s, prev_l = prev[d.index]
+            delta = (d.cumulative_spend - prev_s) + (d.cumulative_landauer - prev_l)
+            ledger2.record_replenish(d, delta)
+
+    assert np.allclose(traj_auto[-1], rho, atol=1e-14)
+    assert abs(ledger1.total_spend - ledger2.total_spend) < 1e-9
+    assert abs(ledger1.total_replenish - ledger2.total_replenish) < 1e-9
+    assert abs(ledger1.drift() - ledger2.drift()) < 1e-12
+
+
+def test_multi_daemon_run_with_replenishment_no_record():
+    circ, _, _ = _make_multi_daemon_circ()
+    circ.h(0).dephase(dt=1.0)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    final = circ.run_with_replenishment(rho0, n_steps=5, record=False)
+    assert final.shape == (4, 4)
+
+
+def test_multi_daemon_run_with_replenishment_zero_steps():
+    circ, daemons, ledger = _make_multi_daemon_circ()
+    circ.h(0).dephase(dt=1.0)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    traj = circ.run_with_replenishment(rho0, n_steps=0)
+    assert traj.shape == (1, 4, 4)
+    assert ledger.total_spend == 0.0
+    assert ledger.total_replenish == 0.0
+
+
+def test_multi_daemon_run_with_replenishment_rejects_no_daemon():
+    """Without daemons, raises ValueError."""
+    circ = fpm.Circuit(2)  # no daemons
+    circ.h(0).dephase(gamma=0.05)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    with pytest.raises(ValueError, match="requires a daemon"):
+        circ.run_with_replenishment(rho0, n_steps=5)
+
+
+# --- Multi-daemon with explicit gamma ---
+
+def test_multi_daemon_explicit_gamma_uniform_dephasing():
+    """Explicit gamma applies uniform dephasing, billing split equally."""
+    circ, daemons, ledger = _make_multi_daemon_circ(cost_per_op=1e-5)
+    circ.dephase(gamma=0.05, dt=1.0)
+    rho0 = fpm.pure_state([1, 1, 1, 1])
+    rho1 = circ.step(rho0)
+    # All off-diagonal elements should decay by the same kappa.
+    # (uniform dephasing, not per-qubit)
+    kappa = 1.0 - 0.05  # euler
+    for i in range(4):
+        for j in range(4):
+            if i != j:
+                expected = kappa * rho0[i, j]
+                assert abs(rho1[i, j] - expected) < 1e-12, (
+                    f"rho[{i},{j}] = {rho1[i, j]}, expected {expected}"
+                )
+
+
+def test_multi_daemon_explicit_gamma_splits_billing():
+    circ, daemons, ledger = _make_multi_daemon_circ(cost_per_op=1e-5)
+    circ.dephase(gamma=0.05, dt=1.0)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    circ.step(rho0)
+    # Billing split equally.
+    assert abs(daemons[0].cumulative_spend - daemons[1].cumulative_spend) < 1e-9
+
+
+# --- Strang splitting in multi-daemon mode ---
+
+def test_multi_daemon_strang_step_works():
+    """strang_step works in multi-daemon mode with endogenous gamma."""
+    circ, daemons, ledger = _make_multi_daemon_circ(
+        n_qubits=1, energies=(80.0,), cost_per_op=1e-6,
+        default_gate_power=0.1,
+    )
+    H = np.array([[1, 1], [1, -1]], dtype=complex) * 0.5
+    rho0 = fpm.pure_state([1, 1])
+    rho1 = circ.strang_step(rho0, H, gamma=None, dt=0.5)
+    assert fpm.is_density_matrix(rho1)
+    # Daemon should have been billed.
+    assert daemons[0].cumulative_spend > 0
+
+
+def test_multi_daemon_strang_step_bills_all_daemons():
+    """strang_step in multi-daemon mode bills all daemons for unitary halves."""
+    circ, daemons, ledger = _make_multi_daemon_circ(cost_per_op=1e-6)
+    H = np.eye(4, dtype=complex) * 0.1
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    circ.strang_step(rho0, H, gamma=0.05, dt=0.5)
+    # Both daemons should be billed for the unitary halves.
+    assert daemons[0].cumulative_spend > 0
+    assert daemons[1].cumulative_spend > 0
+
+
+# --- Three-qubit multi-daemon ---
+
+def test_multi_daemon_three_qubits():
+    """Multi-daemon mode works with 3 qubits."""
+    circ, daemons, ledger = _make_multi_daemon_circ(
+        n_qubits=3, energies=(80.0, 60.0, 40.0),
+        cost_per_op=1e-6,
+    )
+    circ.h(0).cx(0, 1).cx(1, 2).dephase(dt=1.0)
+    rho0 = fpm.pure_state([1, 0, 0, 0, 0, 0, 0, 0])  # |000>
+    traj = circ.run_with_replenishment(rho0, n_steps=10)
+    assert traj.shape == (11, 8, 8)
+    # All three daemons should have been billed.
+    for i, d in enumerate(daemons):
+        assert d.cumulative_spend > 0, f"daemon {i} not billed"
+    # Network drift should be ~0.
+    assert ledger.drift() < 1e-9
+
+
+# --- Energy floor in multi-daemon mode ---
+
+def test_multi_daemon_energy_floor_respected():
+    """A daemon near the floor is floored; dephase still works."""
+    circ, daemons, ledger = _make_multi_daemon_circ(
+        energies=(5.0, 80.0), cost_per_op=1.0,  # huge cost
+    )
+    circ.h(0).dephase(dt=1.0)
+    rho0 = fpm.pure_state([1, 0, 0, 0])
+    circ.step(rho0)
+    # d0 should be at or above the floor.
+    floor = fpm.ENERGY_FLOOR_FRACTION * 100.0
+    assert daemons[0].E >= floor - 1e-9
+
+
+# --- Falsification in multi-daemon mode ---
+
+def test_multi_daemon_falsification_via_endogenous_gamma():
+    """Endogenous gamma from a low-energy daemon can falsify FPM."""
+    ledger = fpm.ConservationLedger(E_max_total=100.0)
+    d0 = ledger.add_daemon(1.0)  # very low energy
+    d1 = ledger.add_daemon(80.0)
+    circ = fpm.Circuit(
+        2, daemons=[d0, d1], ledger=ledger,
+        method="euler", bounded=True,
+        default_gate_power=100.0, cost_per_op=1e-6,
+    )
+    circ.dephase(dt=0.001)  # small dt -> large gamma from d0
+    rho0 = fpm.pure_state([1, 1, 1, 1])
+    with pytest.raises(fpm.FalsificationError, match="falsification"):
+        circ.step(rho0)
+
+
+# --- Public API exposure ---
+
+def test_circuit_daemons_attribute_exposed():
+    """The `daemons` attribute is publicly accessible."""
+    circ, daemons, _ = _make_multi_daemon_circ()
+    assert circ.daemons is not None
+    assert len(circ.daemons) == 2
+
+
+def test_circuit_is_multi_daemon_property():
+    circ, _, _ = _make_multi_daemon_circ()
+    assert circ.is_multi_daemon is True
+    circ2 = fpm.Circuit(2)
+    assert circ2.is_multi_daemon is False
+
+
+def test_circuit_all_daemons_property():
+    """all_daemons returns the list of all daemons."""
+    circ, daemons, _ = _make_multi_daemon_circ()
+    assert circ.all_daemons == list(daemons)
+    # Single-daemon mode.
+    ledger = fpm.ConservationLedger(E_max_total=100.0)
+    daemon = ledger.add_daemon(80.0)
+    circ2 = fpm.Circuit(2, daemon=daemon, ledger=ledger)
+    assert circ2.all_daemons == [daemon]
+    # No daemons.
+    circ3 = fpm.Circuit(2)
+    assert circ3.all_daemons == []

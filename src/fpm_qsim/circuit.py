@@ -231,7 +231,10 @@ def _embed_gate(
 class _Op:
     """Internal record of a queued operation."""
 
-    __slots__ = ("kind", "U", "targets", "dt", "gamma", "gate_power", "load")
+    __slots__ = (
+        "kind", "U", "targets", "dt",
+        "gamma", "gate_power", "load", "dephase_targets",
+    )
 
     def __init__(
         self,
@@ -243,6 +246,7 @@ class _Op:
         gamma: Optional[float] = None,
         gate_power: Optional[float] = None,
         load: Optional[float] = None,
+        dephase_targets: Optional[Tuple[int, ...]] = None,
     ):
         self.kind = kind  # "U" or "D"
         self.U = U
@@ -251,6 +255,10 @@ class _Op:
         self.gamma = gamma
         self.gate_power = gate_power
         self.load = load
+        # For "D" ops: which qubits this dephasing layer applies to.
+        # None means "all qubits" (default).  Used by multi-daemon mode
+        # to route per-qubit endogenous gamma derivation.
+        self.dephase_targets = dephase_targets
 
     def describe(self) -> str:
         if self.kind == "U":
@@ -262,6 +270,8 @@ class _Op:
             parts.append(f"gate_power={self.gate_power:.4g}")
         if self.load is not None:
             parts.append(f"load={self.load:.4g}")
+        if self.dephase_targets is not None:
+            parts.append(f"qubits={list(self.dephase_targets)}")
         return "D(" + ", ".join(parts) + ")"
 
 
@@ -280,13 +290,37 @@ class Circuit:
         in :func:`_embed_gate`.  For larger systems, build the full
         unitary externally and pass it to :meth:`apply_unitary_full`.
     daemon : DaemonState, optional
-        Daemon paying for simulated operations.  When provided together
-        with ``ledger``, every gate and dephasing layer bills the
-        ledger automatically.
+        Single daemon paying for all simulated operations.  When
+        provided together with ``ledger``, every gate and dephasing
+        layer bills the ledger automatically.  Mutually exclusive
+        with ``daemons``.
+    daemons : sequence of DaemonState, optional
+        **v0.1.8.** Per-qubit daemons.  When provided together with
+        ``ledger``, each operation is billed to the daemon(s) owning
+        the target qubit(s):
+
+        * Single-qubit gate on qubit ``i`` bills ``daemons[i]``.
+        * Two-qubit gate on qubits ``i, j`` splits the bill 50/50
+          between ``daemons[i]`` and ``daemons[j]``.
+        * ``apply_unitary_full`` bills all daemons equally.
+        * Dephasing layer with ``dephase_targets=[i, j, ...]`` bills
+          each named daemon for its qubit's off-diagonal state
+          variables.  Dephasing layer without ``dephase_targets``
+          bills all daemons.
+
+        Per-qubit dephasing: when ``daemons`` is set and a dephasing
+        layer uses endogenous gamma (no explicit ``gamma``), each
+        qubit's dephasing rate is derived from its own daemon's
+        energy budget.  This is the structural change that turns a
+        multi-qubit circuit into a network of FPM daemons with the
+        closed-universe identity holding across all of them.
+
+        The length of ``daemons`` must equal ``n_qubits``.
+        Mutually exclusive with ``daemon``.
     ledger : ConservationLedger, optional
         Closed-universe ledger.  When provided together with
-        ``daemon``, every gate and dephasing layer bills the ledger
-        automatically.
+        ``daemon`` or ``daemons``, every gate and dephasing layer
+        bills the ledger automatically.
     method : {"exact", "euler"}, optional
         Default FPM affine-map form for dephasing layers.  See
         :func:`fpm_qsim.lindblad_step`.  Default ``"exact"``.
@@ -318,6 +352,12 @@ class Circuit:
     between calls.  Callers pass ``rho0`` to :meth:`run` and receive
     the trajectory (or final state).
 
+    Multi-daemon mode (v0.1.8) is the structural primitive for FPM
+    network simulations: each qubit is a daemon, the closed-universe
+    ledger spans all daemons, and ``run_with_replenishment`` keeps the
+    network-wide identity ``total_replenish == total_spend +
+    total_landauer`` satisfied.
+
     Examples
     --------
     Minimal usage (no daemon, no ledger)::
@@ -330,7 +370,7 @@ class Circuit:
         >>> traj.shape
         (6, 4, 4)
 
-    FPM-aligned usage (closed-universe billing)::
+    Single-daemon usage (closed-universe billing)::
 
         >>> ledger = fpm.ConservationLedger(E_max_total=100.0)
         >>> daemon = ledger.add_daemon(80.0)
@@ -341,6 +381,20 @@ class Circuit:
         >>> rho0 = fpm.pure_state([1, 0])
         >>> traj = circ.run(rho0, n_steps=5)
         >>> # daemon.E has been debited for every simulated op.
+
+    Multi-daemon usage (v0.1.8, per-qubit FPM network)::
+
+        >>> ledger = fpm.ConservationLedger(E_max_total=100.0)
+        >>> d0 = ledger.add_daemon(80.0)
+        >>> d1 = ledger.add_daemon(60.0)
+        >>> circ = fpm.Circuit(
+        ...     2, daemons=[d0, d1], ledger=ledger, method="euler",
+        ... )
+        >>> circ.h(0).cx(0, 1).dephase(gate_power=0.1)
+        >>> rho0 = fpm.pure_state([1, 0, 0, 0])
+        >>> traj = circ.run_with_replenishment(rho0, n_steps=20)
+        >>> # Each daemon billed for its own qubit's ops.
+        >>> # Network-wide ledger.drift() is ~0.
     """
 
     def __init__(
@@ -348,6 +402,7 @@ class Circuit:
         n_qubits: int,
         *,
         daemon: Optional[DaemonState] = None,
+        daemons: Optional[Sequence[DaemonState]] = None,
         ledger: Optional[ConservationLedger] = None,
         method: str = "exact",
         bounded: bool = False,
@@ -368,12 +423,38 @@ class Circuit:
             raise ValueError(
                 f"method must be 'exact' or 'euler'; got {method!r}."
             )
-        if (daemon is None) != (ledger is None):
+        if daemon is not None and daemons is not None:
             raise ValueError(
-                "Provide both daemon and ledger, or neither. "
+                "Provide either daemon (single) or daemons (per-qubit), "
+                "not both."
+            )
+        # Normalize: if `daemon` is set, treat it as a single-daemon
+        # circuit.  If `daemons` is set, validate length and use it.
+        # Either way, ledger must be present iff any daemon is present.
+        has_daemon = daemon is not None or daemons is not None
+        if has_daemon != (ledger is not None):
+            raise ValueError(
+                "Provide daemons together with ledger, or neither. "
                 f"Got daemon={'set' if daemon else 'None'}, "
+                f"daemons={'set' if daemons else 'None'}, "
                 f"ledger={'set' if ledger else 'None'}."
             )
+        if daemons is not None:
+            daemons_list = list(daemons)
+            if len(daemons_list) != n_qubits:
+                raise ValueError(
+                    f"daemons length {len(daemons_list)} does not match "
+                    f"n_qubits {n_qubits}."
+                )
+            for i, d in enumerate(daemons_list):
+                if not isinstance(d, DaemonState):
+                    raise TypeError(
+                        f"daemons[{i}] must be a DaemonState, got "
+                        f"{type(d).__name__}."
+                    )
+            daemons_tuple = tuple(daemons_list)
+        else:
+            daemons_tuple = None
         if cost_per_op < 0.0:
             raise ValueError(
                 f"cost_per_op must be >= 0, got {cost_per_op}."
@@ -385,7 +466,10 @@ class Circuit:
 
         self.n_qubits = int(n_qubits)
         self.dim = 2 ** self.n_qubits
+        # Single-daemon mode (backward compatible).
         self.daemon = daemon
+        # Multi-daemon mode (v0.1.8).  None in single-daemon mode.
+        self.daemons = daemons_tuple
         self.ledger = ledger
         self.method = method
         self.bounded = bool(bounded)
@@ -399,6 +483,43 @@ class Circuit:
         self._ops: List[_Op] = []
         self.gates_applied = 0
         self.dephase_layers_applied = 0
+
+    # ------------------------------------------------------------------
+    # Multi-daemon helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def is_multi_daemon(self) -> bool:
+        """True if this circuit was constructed with per-qubit daemons."""
+        return self.daemons is not None
+
+    @property
+    def all_daemons(self) -> List[DaemonState]:
+        """All daemons attached to this circuit (1 in single-daemon mode)."""
+        if self.daemons is not None:
+            return list(self.daemons)
+        if self.daemon is not None:
+            return [self.daemon]
+        return []
+
+    def _daemon_for_qubit(self, i: int) -> Optional[DaemonState]:
+        """Return the daemon owning qubit ``i``, or the single daemon."""
+        if self.daemons is not None:
+            return self.daemons[i]
+        return self.daemon
+
+    def _daemons_for_targets(
+        self, targets: Sequence[int]
+    ) -> List[DaemonState]:
+        """Return the daemons owning the named target qubits.
+
+        In single-daemon mode, returns ``[self.daemon]`` (deduplicated
+        to one entry).  In multi-daemon mode, returns one daemon per
+        target.
+        """
+        if self.daemons is not None:
+            return [self.daemons[t] for t in targets]
+        return [self.daemon] if self.daemon is not None else []
 
     # ------------------------------------------------------------------
     # Queue builders (fluent)
@@ -515,6 +636,7 @@ class Circuit:
         dt: float = 1.0,
         gate_power: Optional[float] = None,
         load: Optional[float] = None,
+        targets: Optional[Sequence[int]] = None,
     ) -> "Circuit":
         """Append a dephasing layer.
 
@@ -523,7 +645,7 @@ class Circuit:
         gamma : float, optional
             Explicit dephasing rate.  If omitted, derives gamma from
             the attached ``daemon`` (requires the circuit to have been
-            constructed with a ``daemon``).  See
+            constructed with a ``daemon`` or ``daemons``).  See
             :func:`fpm_qsim.gamma_from_energy`.
         dt : float, optional
             Time step for the dephasing layer.  Default 1.0.
@@ -533,10 +655,31 @@ class Circuit:
         load : float, optional
             Baryonic load for endogenous-gamma derivation.  Falls back
             to ``default_load`` -> ``daemon.load`` -> 0.0.
+        targets : sequence of int, optional
+            **v0.1.8.** Which qubits this dephasing layer applies to.
+            If ``None`` (default), applies to all qubits.  In
+            multi-daemon mode, each named qubit's daemon is billed
+            for its qubit's off-diagonal state variables, and each
+            qubit's dephasing rate is derived from its own daemon.
+            In single-daemon mode, ``targets`` is recorded but does
+            not change billing (the single daemon pays for everything).
+
+            Use this to model **targeted dephasing** — e.g. only
+            qubit 0 decoheres while qubit 1 is isolated::
+
+                circ.dephase(gate_power=0.1, targets=[0])
+
+            Or to model per-qubit endogenous noise in a multi-daemon
+            circuit::
+
+                # Qubit 0 (energy-rich) dephases slowly, qubit 1
+                # (energy-poor) dephases fast — both derived from
+                # their own daemons.
+                circ.dephase(gate_power=0.1, targets=[0, 1])
         """
         if dt < 0.0:
             raise ValueError(f"dt must be >= 0, got {dt}.")
-        if gamma is None and self.daemon is None:
+        if gamma is None and self.daemon is None and self.daemons is None:
             raise ValueError(
                 "dephase() requires either explicit gamma or a daemon "
                 "attached to the circuit."
@@ -546,6 +689,21 @@ class Circuit:
                 "Provide either explicit gamma or endogenous-gamma "
                 "inputs (gate_power/load), not both."
             )
+        # Validate targets.
+        if targets is not None:
+            targets_t = tuple(int(t) for t in targets)
+            if len(set(targets_t)) != len(targets_t):
+                raise ValueError(
+                    f"dephase targets must be distinct; got {targets_t}."
+                )
+            for t in targets_t:
+                if not 0 <= t < self.n_qubits:
+                    raise ValueError(
+                        f"dephase target {t} out of range for "
+                        f"{self.n_qubits} qubits."
+                    )
+        else:
+            targets_t = None
         self._ops.append(
             _Op(
                 "D",
@@ -553,6 +711,7 @@ class Circuit:
                 gamma=gamma,
                 gate_power=gate_power,
                 load=load,
+                dephase_targets=targets_t,
             )
         )
         return self
@@ -585,7 +744,7 @@ class Circuit:
     # Billing helpers
     # ------------------------------------------------------------------
 
-    def _bill_unitary(self, dim: int) -> None:
+    def _bill_unitary(self, dim: int, targets: Sequence[int]) -> None:
         """Bill the simulated Taylor construction of a dim×dim matrix exp.
 
         Under FPM, ``expm(-1j H dt)`` is a continuous-math oracle.  We
@@ -593,19 +752,52 @@ class Circuit:
         K-term Taylor series.  This is a conservative approximation of
         the actual scaling-and-squaring cost; it is honest about the
         oracle break without modeling the full Padé algorithm.
+
+        In multi-daemon mode, the bill is split equally across the
+        daemons owning the named ``targets``.  In single-daemon mode,
+        the single daemon pays the whole bill.
         """
-        if self.ledger is None or self.daemon is None:
+        if self.ledger is None:
+            return
+        daemons = self._daemons_for_targets(targets)
+        if not daemons:
             return
         n_elements = dim * dim
         n_mul, n_add = exp_route_cost(self.taylor_order)
-        self.ledger.bill_compute_cost(
-            self.daemon,
-            n_multiplies=n_mul * n_elements,
-            n_adds=n_add * n_elements,
-            cost_per_op=self.cost_per_op,
-        )
+        total_mul = n_mul * n_elements
+        total_add = n_add * n_elements
+        # Single-daemon mode: one daemon, full bill.
+        if len(daemons) == 1 or not self.is_multi_daemon:
+            self.ledger.bill_compute_cost(
+                daemons[0],
+                n_multiplies=total_mul,
+                n_adds=total_add,
+                cost_per_op=self.cost_per_op,
+            )
+            return
+        # Multi-daemon mode: split equally.  Use integer division and
+        # give the remainder to the first daemon.
+        n = len(daemons)
+        per_mul = total_mul // n
+        per_add = total_add // n
+        rem_mul = total_mul - per_mul * n
+        rem_add = total_add - per_add * n
+        for i, d in enumerate(daemons):
+            extra_mul = rem_mul if i == 0 else 0
+            extra_add = rem_add if i == 0 else 0
+            self.ledger.bill_compute_cost(
+                d,
+                n_multiplies=per_mul + extra_mul,
+                n_adds=per_add + extra_add,
+                cost_per_op=self.cost_per_op,
+            )
 
-    def _bill_dephase(self, dim: int, method: str) -> None:
+    def _bill_dephase(
+        self,
+        dim: int,
+        method: str,
+        dephase_targets: Optional[Sequence[int]],
+    ) -> None:
         """Bill one dephasing layer's simulated construction cost.
 
         For ``method="euler"``: 1 mul + 1 add per off-diagonal state
@@ -615,25 +807,185 @@ class Circuit:
 
         For ``method="exact"``: 1 scalar ``exp`` per off-diagonal
         state variable, each billed via a K-term Taylor series.
+
+        In multi-daemon mode, the bill is split across the daemons
+        owning ``dephase_targets`` (or all daemons if None).
         """
-        if self.ledger is None or self.daemon is None:
+        if self.ledger is None:
+            return
+        # Determine which daemons pay.
+        if dephase_targets is not None:
+            daemons = self._daemons_for_targets(dephase_targets)
+        else:
+            daemons = self.all_daemons
+        if not daemons:
             return
         n_state_vars = dim * (dim - 1)
         if method == "euler":
-            self.ledger.bill_compute_cost(
-                self.daemon,
-                n_multiplies=n_state_vars,
-                n_adds=n_state_vars,
-                cost_per_op=self.cost_per_op,
-            )
+            total_mul = n_state_vars
+            total_add = n_state_vars
         else:  # exact
             n_mul, n_add = exp_route_cost(self.taylor_order)
+            total_mul = n_mul * n_state_vars
+            total_add = n_add * n_state_vars
+        # Single-daemon mode: one daemon, full bill.
+        if len(daemons) == 1 or not self.is_multi_daemon:
             self.ledger.bill_compute_cost(
-                self.daemon,
-                n_multiplies=n_mul * n_state_vars,
-                n_adds=n_add * n_state_vars,
+                daemons[0],
+                n_multiplies=total_mul,
+                n_adds=total_add,
                 cost_per_op=self.cost_per_op,
             )
+            return
+        # Multi-daemon mode: split equally.
+        n = len(daemons)
+        per_mul = total_mul // n
+        per_add = total_add // n
+        rem_mul = total_mul - per_mul * n
+        rem_add = total_add - per_add * n
+        for i, d in enumerate(daemons):
+            extra_mul = rem_mul if i == 0 else 0
+            extra_add = rem_add if i == 0 else 0
+            self.ledger.bill_compute_cost(
+                d,
+                n_multiplies=per_mul + extra_mul,
+                n_adds=per_add + extra_add,
+                cost_per_op=self.cost_per_op,
+            )
+
+    # ------------------------------------------------------------------
+    # Per-qubit dephasing (multi-daemon mode)
+    # ------------------------------------------------------------------
+
+    def _apply_per_qubit_dephase(
+        self,
+        rho: np.ndarray,
+        op: "_Op",
+    ) -> np.ndarray:
+        """Apply dephasing with per-qubit endogenous gamma.
+
+        In multi-daemon mode with endogenous gamma (op.gamma is None),
+        each qubit's dephasing rate is derived from its own daemon.
+        We apply the dephasing as a sequence of per-qubit
+        ``lindblad_step`` calls, each using the embedded single-qubit
+        dephasing channel for that qubit.
+
+        This is the structural primitive for FPM network simulations:
+        each qubit decoheres at its own endogenous rate, derived from
+        its own daemon's energy budget.
+
+        For explicit-gamma dephasing in multi-daemon mode, the same
+        gamma is applied to all target qubits (uniform dephasing), and
+        billing is still split across the daemons.
+        """
+        # Determine which qubits to dephase.
+        if op.dephase_targets is not None:
+            qubits = list(op.dephase_targets)
+        else:
+            qubits = list(range(self.n_qubits))
+
+        # Resolve endogenous-gamma inputs (used as defaults for all
+        # qubits; per-qubit daemons override the daemon attribute).
+        gate_power = op.gate_power
+        if gate_power is None:
+            gate_power = self.default_gate_power
+        load = op.load
+        if load is None:
+            load = self.default_load
+
+        if op.gamma is not None:
+            # Explicit gamma: apply uniform dephasing to the full
+            # density matrix in one call.  Billing is handled by the
+            # caller via _bill_dephase.
+            return lindblad_step(
+                rho,
+                gamma=op.gamma,
+                dt=op.dt,
+                method=self.method,
+                bounded=self.bounded,
+            )
+
+        # Endogenous gamma: per-qubit, each from its own daemon.
+        # Apply each qubit's dephasing in sequence.  Each call uses
+        # the embedded single-qubit dephasing channel (only the
+        # off-diagonal elements involving that qubit are contracted).
+        for q in qubits:
+            daemon = self._daemon_for_qubit(q)
+            # Build the embedded single-qubit dephasing channel.
+            # We use lindblad_step on the full density matrix but with
+            # a per-qubit gamma.  This is correct because dephasing is
+            # a tensor-product channel: applying dephasing on qubit q
+            # contracts all off-diagonal elements that differ in
+            # qubit q's index.
+            #
+            # However, lindblad_step as currently implemented applies
+            # uniform dephasing to ALL off-diagonal elements.  For
+            # per-qubit dephasing we need a different approach: apply
+            # the dephasing channel only to elements where qubit q's
+            # index differs between row and column.
+            rho = self._dephase_single_qubit(rho, q, op.dt, gate_power, load)
+        return rho
+
+    def _dephase_single_qubit(
+        self,
+        rho: np.ndarray,
+        qubit: int,
+        dt: float,
+        gate_power: float,
+        load: Optional[float],
+    ) -> np.ndarray:
+        """Apply dephasing to a single qubit of a multi-qubit density matrix.
+
+        Contracts off-diagonal elements where qubit ``qubit``'s index
+        differs between row and column, using the endogenous gamma
+        derived from that qubit's daemon.  Leaves all other elements
+        untouched.
+
+        This is the per-qubit dephasing primitive for multi-daemon
+        circuits.
+        """
+        daemon = self._daemon_for_qubit(qubit)
+        if daemon is None:
+            # No daemon for this qubit — no dephasing.
+            return rho
+        gamma = gamma_from_energy(
+            daemon,
+            gate_power=gate_power,
+            load=load,
+            dt=dt,
+            bounded=self.bounded,
+        )
+        # Determine the contraction coefficient.
+        if self.method == "euler":
+            product = gamma * dt
+            if product < 0.0 or product > 1.0:
+                raise ValueError(
+                    f"method='euler' requires 0 <= gamma*dt <= 1 for the "
+                    f"affine map to remain contractive; got gamma*dt = "
+                    f"{product:.6g} for qubit {qubit}. Use method='exact' "
+                    f"for unbounded gamma*dt, or reduce dt."
+                )
+            kappa = 1.0 - product
+        else:  # exact
+            kappa = float(np.exp(-gamma * dt))
+
+        # Build a mask of off-diagonal elements where qubit `qubit`'s
+        # index differs between row and column.
+        n = self.dim
+        # For each (i, j), check if bit `qubit` of i differs from
+        # bit `qubit` of j.
+        indices = np.arange(n)
+        bit_i = (indices >> (self.n_qubits - 1 - qubit)) & 1
+        # mask[i, j] = True where bit qubit of i != bit qubit of j
+        mask = bit_i[:, None] != bit_i[None, :]
+        # Apply contraction to those elements.
+        out = rho.copy()
+        # Off-diagonal elements where qubit differs: contract by kappa.
+        # All other elements (diagonal, or off-diagonal where qubit
+        # matches) are unchanged.
+        contraction = np.where(mask, kappa, 1.0)
+        out = out * contraction
+        return out
 
     # ------------------------------------------------------------------
     # Execution
@@ -669,27 +1021,52 @@ class Circuit:
                 # ontological billing of the simulated construction
                 # cost via _bill_unitary).
                 rho_arr = op.U @ rho_arr @ op.U.conj().T
-                self._bill_unitary(self.dim)
+                self._bill_unitary(self.dim, op.targets)
                 self.gates_applied += 1
             elif op.kind == "D":
-                # Resolve endogenous-gamma inputs.
-                gate_power = op.gate_power
-                if gate_power is None:
-                    gate_power = self.default_gate_power
-                load = op.load
-                if load is None:
-                    load = self.default_load
-                rho_arr = lindblad_step(
-                    rho_arr,
-                    gamma=op.gamma,
-                    dt=op.dt,
-                    daemon=self.daemon if op.gamma is None else None,
-                    gate_power=gate_power if op.gamma is None else None,
-                    load=load if op.gamma is None else None,
-                    method=self.method,
-                    bounded=self.bounded,
-                )
-                self._bill_dephase(self.dim, self.method)
+                if self.is_multi_daemon and op.gamma is None:
+                    # Per-qubit endogenous dephasing: each qubit's
+                    # gamma derived from its own daemon.
+                    rho_arr = self._apply_per_qubit_dephase(rho_arr, op)
+                    self._bill_dephase(
+                        self.dim, self.method, op.dephase_targets
+                    )
+                else:
+                    # Single-daemon mode, or explicit gamma: use the
+                    # original lindblad_step path.
+                    gate_power = op.gate_power
+                    if gate_power is None:
+                        gate_power = self.default_gate_power
+                    load = op.load
+                    if load is None:
+                        load = self.default_load
+                    # In multi-daemon mode with explicit gamma, no
+                    # daemon is passed to lindblad_step (gamma is
+                    # explicit).  In single-daemon mode with explicit
+                    # gamma, also pass daemon=None.  In single-daemon
+                    # mode with endogenous gamma, pass self.daemon.
+                    if op.gamma is not None:
+                        daemon_for_step = None
+                        gate_power_for_step = None
+                        load_for_step = None
+                    else:
+                        # Endogenous gamma in single-daemon mode.
+                        daemon_for_step = self.daemon
+                        gate_power_for_step = gate_power
+                        load_for_step = load
+                    rho_arr = lindblad_step(
+                        rho_arr,
+                        gamma=op.gamma,
+                        dt=op.dt,
+                        daemon=daemon_for_step,
+                        gate_power=gate_power_for_step,
+                        load=load_for_step,
+                        method=self.method,
+                        bounded=self.bounded,
+                    )
+                    self._bill_dephase(
+                        self.dim, self.method, op.dephase_targets
+                    )
                 self.dephase_layers_applied += 1
             else:  # pragma: no cover - defensive
                 raise RuntimeError(f"unknown op kind: {op.kind!r}")
@@ -765,10 +1142,15 @@ class Circuit:
         This is the FPM closed-universe conservation theorem (paper
         Test 03) made operational at the circuit level.
 
-        Requires ``daemon`` and ``ledger`` to be attached to the
-        circuit.  Use plain :meth:`run` if you want to manage
-        replenishment manually (or skip it for open-system
+        Requires ``daemon`` (or ``daemons``) and ``ledger`` to be
+        attached to the circuit.  Use plain :meth:`run` if you want to
+        manage replenishment manually (or skip it for open-system
         simulations).
+
+        In multi-daemon mode (v0.1.8), replenishes **every** daemon
+        by exactly what it spent that tick.  The network-wide identity
+        ``total_replenish == total_spend + total_landauer`` holds to
+        within floor/ceiling clipping.
 
         Parameters
         ----------
@@ -794,14 +1176,14 @@ class Circuit:
 
         Notes
         -----
-        The replenishment each tick is::
+        The replenishment each tick is, per daemon::
 
-            spend_delta   = daemon.cumulative_spend   - prev_spend
+            spend_delta    = daemon.cumulative_spend    - prev_spend
             landauer_delta = daemon.cumulative_landauer - prev_landauer
             ledger.record_replenish(daemon, spend_delta + landauer_delta)
 
-        If the daemon is near ``E_max``, the actual replenishment is
-        capped (``record_replenish`` clips at ``E_max - E``).  If the
+        If a daemon is near ``E_max``, the actual replenishment is
+        capped (``record_replenish`` clips at ``E_max - E``).  If a
         daemon is near the energy floor, the spend is also capped.
         Both clippings can produce non-zero drift; this is honest
         behavior &mdash; the framework is reporting that the configured
@@ -814,7 +1196,7 @@ class Circuit:
 
         Examples
         --------
-        ::
+        Single-daemon mode::
 
             ledger = fpm.ConservationLedger(E_max_total=100.0)
             daemon = ledger.add_daemon(80.0)
@@ -826,12 +1208,28 @@ class Circuit:
             rho0 = fpm.pure_state([1, 0, 0, 0])
             traj = circ.run_with_replenishment(rho0, n_steps=20)
             # ledger.drift() should be ~0 (no external landauer).
+
+        Multi-daemon mode (v0.1.8)::
+
+            ledger = fpm.ConservationLedger(E_max_total=100.0)
+            d0 = ledger.add_daemon(80.0)
+            d1 = ledger.add_daemon(60.0)
+            circ = fpm.Circuit(
+                2, daemons=[d0, d1], ledger=ledger, method="euler",
+            )
+            circ.h(0).cx(0, 1).dephase(gate_power=0.05)
+
+            rho0 = fpm.pure_state([1, 0, 0, 0])
+            traj = circ.run_with_replenishment(rho0, n_steps=20)
+            # Each daemon replenished for its own spend.
+            # Network-wide ledger.drift() is ~0.
         """
-        if self.daemon is None or self.ledger is None:
+        if not self.all_daemons or self.ledger is None:
             raise ValueError(
-                "run_with_replenishment requires a daemon and ledger "
-                "attached to the circuit. Construct with "
-                "Circuit(..., daemon=..., ledger=...), or use run() "
+                "run_with_replenishment requires a daemon (or daemons) "
+                "and ledger attached to the circuit. Construct with "
+                "Circuit(..., daemon=..., ledger=...) or "
+                "Circuit(..., daemons=..., ledger=...), or use run() "
                 "for open-system simulations without replenishment."
             )
         if n_steps < 0:
@@ -859,23 +1257,32 @@ class Circuit:
         return traj
 
     def _step_with_replenishment(self, rho: np.ndarray) -> np.ndarray:
-        """Apply one ``step()`` and replenish the daemon by the
-        debited amount (spend + landauer).
+        """Apply one ``step()`` and replenish every daemon by the
+        amount it was debited that tick (spend + landauer).
 
         This is the closed-universe conservation primitive: every
-        unit of energy debited from the daemon during the step is
-        returned to it immediately afterward, keeping the ledger
-        identity ``replenish == spend + landauer`` satisfied to
-        within floor/ceiling clipping.
+        unit of energy debited from any daemon during the step is
+        returned to it immediately afterward, keeping the network-wide
+        ledger identity ``total_replenish == total_spend +
+        total_landauer`` satisfied to within floor/ceiling clipping.
+
+        In single-daemon mode, replenishes only ``self.daemon``.
+        In multi-daemon mode, replenishes every daemon in
+        ``self.daemons``.
         """
-        prev_spend = self.daemon.cumulative_spend
-        prev_landauer = self.daemon.cumulative_landauer
+        daemons = self.all_daemons
+        # Snapshot cumulative flows before the step.
+        prev_spend = {d.index: d.cumulative_spend for d in daemons}
+        prev_landauer = {d.index: d.cumulative_landauer for d in daemons}
         rho = self.step(rho)
-        spend_delta = self.daemon.cumulative_spend - prev_spend
-        landauer_delta = self.daemon.cumulative_landauer - prev_landauer
-        self.ledger.record_replenish(
-            self.daemon, spend_delta + landauer_delta
-        )
+        # Replenish each daemon by exactly what it spent + was charged
+        # for Landauer this tick.
+        for d in daemons:
+            spend_delta = d.cumulative_spend - prev_spend[d.index]
+            landauer_delta = d.cumulative_landauer - prev_landauer[d.index]
+            self.ledger.record_replenish(
+                d, spend_delta + landauer_delta
+            )
         return rho
 
     def strang_step(
@@ -931,34 +1338,46 @@ class Circuit:
             )
         if dt < 0.0:
             raise ValueError(f"dt must be >= 0, got {dt}.")
-        if gamma is None and self.daemon is None:
+        if gamma is None and not self.all_daemons:
             raise ValueError(
                 "strang_step requires either explicit gamma or a "
-                "daemon attached to the circuit."
+                "daemon (or daemons) attached to the circuit."
             )
 
         half_dt = 0.5 * dt
+        # Targets for billing: in multi-daemon mode, the Strang
+        # splitting applies to the full Hilbert space, so all daemons
+        # are billed.  In single-daemon mode, the single daemon is
+        # billed.
+        all_targets = tuple(range(self.n_qubits))
 
         # First half unitary.
         rho_arr = unitary_step(rho_arr, H_arr, dt=half_dt)
-        self._bill_unitary(self.dim)
+        self._bill_unitary(self.dim, all_targets)
 
         # Full dephasing.
-        rho_arr = lindblad_step(
-            rho_arr,
-            gamma=gamma,
-            dt=dt,
-            daemon=self.daemon if gamma is None else None,
-            gate_power=gate_power if gamma is None else None,
-            load=load if gamma is None else None,
-            method=self.method,
-            bounded=self.bounded,
-        )
-        self._bill_dephase(self.dim, self.method)
+        if self.is_multi_daemon and gamma is None:
+            # Per-qubit endogenous dephasing: use the multi-daemon
+            # path.  Build a synthetic _Op and call
+            # _apply_per_qubit_dephase.
+            op = _Op("D", dt=dt, dephase_targets=None)
+            rho_arr = self._apply_per_qubit_dephase(rho_arr, op)
+        else:
+            rho_arr = lindblad_step(
+                rho_arr,
+                gamma=gamma,
+                dt=dt,
+                daemon=self.daemon if gamma is None else None,
+                gate_power=gate_power if gamma is None else None,
+                load=load if gamma is None else None,
+                method=self.method,
+                bounded=self.bounded,
+            )
+        self._bill_dephase(self.dim, self.method, None)
 
         # Second half unitary.
         rho_arr = unitary_step(rho_arr, H_arr, dt=half_dt)
-        self._bill_unitary(self.dim)
+        self._bill_unitary(self.dim, all_targets)
 
         self.gates_applied += 2
         self.dephase_layers_applied += 1

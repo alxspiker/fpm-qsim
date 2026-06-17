@@ -52,6 +52,15 @@ exactly the energy debited that tick, keeping the conservation
 identity `replenish == spend + landauer` satisfied to ~0 drift
 (when no external Landauer is charged).
 
+As of v0.1.8, the `daemons` parameter attaches a per-qubit
+`DaemonState` to each qubit, turning a multi-qubit circuit into a
+network of FPM daemons.  Each qubit's dephasing rate is derived from
+its own daemon's energy budget, billing is routed to the owning
+daemon(s), and `run_with_replenishment` keeps the network-wide
+identity satisfied across all daemons.  This is the structural
+primitive for the planned `fpm-bft`, `fpm-fed`, and `fpm-marl`
+packages.
+
 For speed, the important distinction is structural vs constant-factor:
 pure dephasing can be implemented in `O(N^2)` per step by any
 dephasing-aware method.  `fpm-qsim` is competitive with that
@@ -397,6 +406,59 @@ Requires `daemon` and `ledger` to be attached.  Raises `ValueError`
 otherwise, pointing users to plain `run()` for open-system
 simulations.
 
+### Multi-daemon circuits (v0.1.8)
+
+The `daemons` parameter attaches a per-qubit `DaemonState` to each
+qubit, turning a multi-qubit circuit into a network of FPM daemons.
+Each qubit's dephasing rate is derived from its own daemon's energy
+budget, billing is routed to the owning daemon(s), and
+`run_with_replenishment` keeps the network-wide identity satisfied
+across all daemons.
+
+```python
+ledger = fpm.ConservationLedger(E_max_total=100.0)
+d0 = ledger.add_daemon(80.0)  # energy-rich -> slow dephasing
+d1 = ledger.add_daemon(40.0)  # energy-poor -> fast dephasing
+circ = fpm.Circuit(
+    2, daemons=[d0, d1], ledger=ledger, method="euler",
+    default_gate_power=0.05, cost_per_op=1e-5,
+)
+circ.h(0).cx(0, 1).dephase(dt=1.0)
+
+rho0 = fpm.pure_state([1, 0, 0, 0])
+traj = circ.run_with_replenishment(rho0, n_steps=20)
+# d0 billed for H + half of CNOT + half of dephase
+# d1 billed for half of CNOT + half of dephase
+# Network-wide ledger.drift() is ~0.
+```
+
+**Per-qubit billing rules:**
+
+| Operation | Billing in multi-daemon mode |
+|---|---|
+| Single-qubit gate on qubit `i` | `daemons[i]` pays the full bill |
+| Two-qubit gate on qubits `i, j` | Split 50/50 between `daemons[i]` and `daemons[j]` |
+| `apply_unitary_full` | All daemons billed equally |
+| `dephase(targets=None)` | All daemons billed |
+| `dephase(targets=[i, ...])` | Only the named daemons billed |
+
+**Per-qubit endogenous γ:** when `daemons` is set and a dephasing
+layer uses endogenous γ (no explicit `gamma`), each qubit's
+dephasing rate is derived from its own daemon's energy budget via
+`gamma_from_energy`.  An energy-rich qubit decoheres slowly; an
+energy-poor qubit decoheres fast.  This is implemented via the
+`_dephase_single_qubit` primitive, which contracts only the
+off-diagonal elements where the target qubit's bit index differs
+between row and column.
+
+**Targeted dephasing:** `dephase(targets=[0])` dephases only qubit
+0, leaving qubit 1's coherences untouched.  Useful for modeling
+isolated subsystems or injecting noise into specific qubits.
+
+**Backward compatibility:** all v0.1.7 single-daemon code continues
+to work unchanged.  Use `daemon=` for single-daemon mode, `daemons=`
+for per-qubit mode.  The two are mutually exclusive.
+
 ---
 
 ## What's distinctive about `fpm-qsim`
@@ -412,6 +474,7 @@ simulations.
 | Endogenous gamma from energy | **Yes (v0.1.5)** | --- | --- | --- |
 | Circuit layer with billing | **Yes (v0.1.6)** | --- | --- | --- |
 | Auto-balanced closed-universe runs | **Yes (v0.1.7)** | --- | --- | --- |
+| Multi-daemon per-qubit networks | **Yes (v0.1.8)** | --- | --- | --- |
 | Combined unitary + dephasing | **`Circuit` queue or `strang_step`** | Built in | Built in | Channel-specific |
 
 The only Lindblad integrator in the Python ecosystem with a
@@ -524,25 +587,28 @@ initial state, wall time reported as the minimum of three repeats.
 | `exp_route_cost(taylor_order=8)` | **v0.1.4.** Return `(n_multiplies, n_adds)` cost of constructing `exp(-gamma*dt)` via a K-term Taylor series under FPM's discrete action principle. |
 | `bill_exp_route_cost(ledger, daemon, taylor_order=8)` | **v0.1.4.** Convenience wrapper: bill the simulated Taylor construction of one `exp` evaluation. Use after each `method="exact"` step to keep the closed-universe ledger balanced despite the oracle. |
 
-### Circuit layer (`fpm_qsim.circuit`) — v0.1.6
+### Circuit layer (`fpm_qsim.circuit`) — v0.1.6, v0.1.7, v0.1.8
 
 | Symbol | Description |
 |---|---|
-| `Circuit(n_qubits, *, daemon=None, ledger=None, method="exact", bounded=False, default_load=None, default_gate_power=None, cost_per_op=1e-5, taylor_order=8)` | Queue-based circuit composing unitary gates with FPM dephasing. Auto-bills the ledger when `daemon` and `ledger` are attached. |
+| `Circuit(n_qubits, *, daemon=None, daemons=None, ledger=None, method="exact", bounded=False, default_load=None, default_gate_power=None, cost_per_op=1e-5, taylor_order=8)` | Queue-based circuit composing unitary gates with FPM dephasing. Use `daemon=` for single-daemon mode (v0.1.6) or `daemons=` for per-qubit multi-daemon mode (v0.1.8). Auto-bills the ledger when daemon(s) and ledger are attached. |
 | `Circuit.h(i)`, `.x(i)`, `.y(i)`, `.z(i)`, `.s(i)`, `.t(i)` | Single-qubit gates (fluent, return self). |
 | `Circuit.u(theta, phi, lam, i)` | General single-qubit unitary. |
 | `Circuit.cx(control, target)`, `.cz(i, j)`, `.swap(i, j)` | Two-qubit gates. |
 | `Circuit.apply_unitary(U, targets)` | Append an arbitrary k-qubit unitary (k ≤ 10). |
 | `Circuit.apply_unitary_full(U_full)` | Append a pre-expanded full-Hilbert-space unitary (any n). |
-| `Circuit.dephase(gamma=None, *, dt=1.0, gate_power=None, load=None)` | Append an FPM dephasing layer. Endogenous gamma derived from daemon if `gamma` is omitted. |
+| `Circuit.dephase(gamma=None, *, dt=1.0, gate_power=None, load=None, targets=None)` | Append an FPM dephasing layer. Endogenous gamma derived from daemon if `gamma` is omitted. **v0.1.8:** `targets` restricts the layer to specific qubits (multi-daemon mode: only named daemons billed). |
 | `Circuit.step(rho)` | Apply the full queued sequence once. Returns the next density matrix. |
 | `Circuit.run(rho0, n_steps=1, *, record=True)` | Apply `step()` `n_steps` times. Returns trajectory of shape `(n_steps+1, dim, dim)` if `record=True`, else final state. |
-| `Circuit.run_with_replenishment(rho0, n_steps=1, *, record=True)` | **v0.1.7.** Same as `run()` but replenishes the daemon by exactly the debited amount (spend + landauer) each tick, keeping the closed-universe ledger balanced. Requires `daemon` and `ledger` attached. |
-| `Circuit.strang_step(rho, H, gamma, dt, *, gate_power=None, load=None)` | One Strang-split round: `U(dt/2) + dephase(dt) + U(dt/2)`. Uses `expm(-i H dt/2)` for the half-steps. Bills three operations. |
+| `Circuit.run_with_replenishment(rho0, n_steps=1, *, record=True)` | **v0.1.7.** Same as `run()` but replenishes each daemon by exactly the debited amount (spend + landauer) each tick, keeping the closed-universe ledger balanced. **v0.1.8:** In multi-daemon mode, replenishes every daemon. |
+| `Circuit.strang_step(rho, H, gamma, dt, *, gate_power=None, load=None)` | One Strang-split round: `U(dt/2) + dephase(dt) + U(dt/2)`. Uses `expm(-i H dt/2)` for the half-steps. Bills three operations. **v0.1.8:** Supports multi-daemon mode with per-qubit endogenous γ. |
 | `Circuit.reset()` | Clear the queue (does not reset billing counters). |
 | `Circuit.reset_stats()` | Reset billing counters (does not clear the queue). |
 | `Circuit.operations` | List of human-readable descriptions of queued ops. |
 | `Circuit.gates_applied`, `.dephase_layers_applied` | Cumulative billing counters. |
+| `Circuit.is_multi_daemon` | **v0.1.8.** `True` if constructed with `daemons=`. |
+| `Circuit.all_daemons` | **v0.1.8.** List of all daemons (1 in single-daemon mode, n_qubits in multi-daemon mode, 0 if no daemon). |
+| `Circuit.daemons` | **v0.1.8.** Tuple of per-qubit daemons, or `None` in single-daemon mode. |
 
 ---
 
@@ -664,6 +730,22 @@ regime where the FPM theorem provides an algebraic correspondence.
 ---
 
 ## Changelog
+
+### 0.1.8 (2026-06-18)
+
+**Multi-daemon circuits: per-qubit FPM networks.**
+
+- Added `daemons` parameter to `Circuit.__init__`: one `DaemonState`
+  per qubit.  Per-qubit billing (single-qubit gate bills only owning
+  daemon; two-qubit gate splits 50/50; `apply_unitary_full` bills all
+  equally).  Per-qubit endogenous γ (each qubit's dephasing rate
+  derived from its own daemon).  Added `targets` keyword to
+  `dephase()` for targeted dephasing.  `run_with_replenishment`
+  replenishes every daemon each tick, keeping the network-wide
+  identity satisfied.
+- 36 new tests in `tests/test_circuit.py`. 181 tests total, all passing.
+- Added `examples/06_multi_daemon.py`.
+- Backward compatible: all v0.1.7 single-daemon code unchanged.
 
 ### 0.1.7 (2026-06-18)
 

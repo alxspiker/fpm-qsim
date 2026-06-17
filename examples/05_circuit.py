@@ -1,5 +1,5 @@
 """
-Example 05: Circuit layer — Bell state preparation with endogenous dephasing.
+Example 05: Circuit layer -- Bell state preparation with endogenous dephasing.
 
 This example demonstrates the v0.1.6 Circuit API and the v0.1.7
 ``run_with_replenishment`` method:
@@ -51,17 +51,23 @@ def main():
     # ------------------------------------------------------------------
     # Run the circuit for 20 ticks with automatic replenishment.
     # ------------------------------------------------------------------
-    rho0 = fpm.pure_state([1, 0, 0, 0])  # |00><00|
-    rho = rho0.copy()
     print(f"\n{'tick':>4}  {'|rho_03|':>10}  {'daemon_E':>10}  "
           f"{'cum_spend':>10}  {'cum_repl':>10}")
+
+    rho0 = fpm.pure_state([1, 0, 0, 0])  # |00><00|
+    rho = rho0.copy()
+    trajectory = [rho.copy()]
+    checkpoints = {0, 4, 9, 14, 19}
     for t in range(20):
         rho = circ.run_with_replenishment(rho, n_steps=1, record=False)
-        if t in (0, 4, 9, 14, 19):
-            print(f"{t + 1:>4}  {abs(rho[0, 3]):>10.4e}  "
-                  f"{daemon.E:>10.4f}  "
-                  f"{ledger.total_spend:>10.4f}  "
-                  f"{ledger.total_replenish:>10.4f}")
+        trajectory.append(rho.copy())
+        if t not in checkpoints:
+            continue
+        print(f"{t + 1:>4}  {abs(rho[0, 3]):>10.4e}  "
+              f"{daemon.E:>10.4f}  "
+              f"{ledger.total_spend:>10.4f}  "
+              f"{ledger.total_replenish:>10.4f}")
+    traj = np.asarray(trajectory)
 
     # ------------------------------------------------------------------
     # Report closed-universe conservation.
@@ -80,7 +86,7 @@ def main():
     print("\n--- Comparison: method='euler' vs method='exact' ---")
 
     # Euler (already done above).
-    rho_euler = rho.copy()
+    rho_euler = traj[-1].copy()
 
     # Reset and re-run with exact method.
     ledger2 = fpm.ConservationLedger(E_max_total=E_max_total)
@@ -124,18 +130,6 @@ def main():
         cost_per_op=1e-5,
     )
     circ3.h(0).cx(0, 1).dephase(dt=1.0)
-    ledger4 = fpm.ConservationLedger(E_max_total=E_max_total)
-    daemon4 = ledger4.add_daemon(E_init=80.0)
-    circ4 = fpm.Circuit(
-        n_qubits=2,
-        daemon=daemon4,
-        ledger=ledger4,
-        method="euler",
-        default_gate_power=0.05,
-        cost_per_op=1e-5,
-    )
-    circ4.h(0).cx(0, 1).dephase(dt=1.0)
-    traj_auto = circ4.run_with_replenishment(rho0, n_steps=20)
     rho = rho0.copy()
     for _ in range(20):
         prev_spend = daemon3.cumulative_spend
@@ -147,7 +141,7 @@ def main():
         )
         ledger3.record_replenish(daemon3, delta)
     print(f"  Final rho matches: "
-          f"{np.allclose(traj_auto[-1], rho, atol=1e-14)}")
+          f"{np.allclose(traj[-1], rho, atol=1e-14)}")
     print(f"  Spend  (auto/manual): "
           f"{ledger.total_spend:.6e} / {ledger3.total_spend:.6e}")
     print(f"  Repl.  (auto/manual): "

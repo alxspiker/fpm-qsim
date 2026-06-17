@@ -1,5 +1,53 @@
 # CHANGES
 
+## 0.1.8 (2026-06-18)
+
+**Multi-daemon circuits: per-qubit FPM networks.**
+
+- Added `daemons` parameter to `Circuit.__init__`.  When provided
+  together with `ledger`, each qubit is backed by its own
+  `DaemonState`, turning a multi-qubit circuit into a network of FPM
+  daemons with the closed-universe identity holding across all of
+  them.  Mutually exclusive with `daemon` (single-daemon mode).
+- **Per-qubit billing**: single-qubit gates bill only the owning
+  daemon.  Two-qubit gates split the bill 50/50 between the two
+  target daemons.  `apply_unitary_full` bills all daemons equally.
+- **Per-qubit endogenous dephasing**: in multi-daemon mode with
+  endogenous γ (no explicit `gamma`), each qubit's dephasing rate is
+  derived from its own daemon's energy budget via
+  `gamma_from_energy`.  An energy-rich qubit decoheres slowly; an
+  energy-poor qubit decoheres fast.  This is the structural primitive
+  for FPM network simulations and the foundation for the planned
+  `fpm-bft`, `fpm-fed`, and `fpm-marl` packages.
+- Added `targets` keyword to `dephase()`: dephase only specific
+  qubits, leaving others untouched.  In multi-daemon mode, only the
+  named daemons are billed for the dephasing layer.  Use this to
+  model isolated subsystems or targeted noise injection.
+- `run_with_replenishment` now replenishes **every** daemon by
+  exactly what it spent that tick (spend + landauer), keeping the
+  network-wide identity `total_replenish == total_spend +
+  total_landauer` satisfied to ~0 drift.
+- New helper properties: `Circuit.is_multi_daemon`,
+  `Circuit.all_daemons`, `Circuit.daemons`.
+- New internal helpers: `_daemon_for_qubit(i)`,
+  `_daemons_for_targets(targets)`, `_apply_per_qubit_dephase(rho, op)`,
+  `_dephase_single_qubit(rho, qubit, dt, gate_power, load)`.
+- `strang_step` updated to support multi-daemon mode: bills all
+  daemons for the unitary halves, uses per-qubit endogenous γ for
+  the dephasing layer when no explicit γ is given.
+- 36 new tests in `tests/test_circuit.py` covering: construction
+  validation, single/two/full-system gate billing, per-qubit
+  endogenous γ (including direct-calculation equivalence), targeted
+  dephasing, closed-universe balancing across multiple daemons,
+  multi-daemon Strang splitting, three-qubit networks, energy-floor
+  behavior, falsification via endogenous γ, and public API exposure.
+  181 tests total, all passing.
+- Added `examples/06_multi_daemon.py` demonstrating per-qubit
+  dephasing, targeted dephasing, and a three-qubit FPM network with
+  network-wide conservation.
+- Backward compatible: all v0.1.7 single-daemon code continues to
+  work unchanged.
+
 ## 0.1.7 (2026-06-18)
 
 **`Circuit.run_with_replenishment` — automatic closed-universe balancing.**
