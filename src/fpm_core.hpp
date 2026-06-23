@@ -20,7 +20,15 @@
 #include <string>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <memory>
+#include <numeric>
+#include <utility>
+#if defined(_MSC_VER)
+#include <malloc.h>
+#endif
 
 #if defined(_MSC_VER)
 #define FPM_RESTRICT __restrict
@@ -40,6 +48,470 @@ constexpr double ENERGY_FLOOR_FRACTION  = 0.03138766217547228;
 constexpr double ISOTROPIC_WEIGHT_LIMIT = 1.0 / 3.0;
 
 using Complex = std::complex<double>;
+
+constexpr size_t FPM_ALIGNMENT = 64;
+constexpr double FPM_PI = 3.141592653589793238462643383279502884;
+constexpr uint8_t FPM_MODE_FLOW = 0;
+constexpr uint8_t FPM_MODE_FATIGUE = 1;
+constexpr uint8_t FPM_MODE_ZOMBIE = 2;
+
+// ---------------------------------------------------------------------------
+// C++17 aligned allocation + non-owning views
+// ---------------------------------------------------------------------------
+
+inline size_t align_up(size_t value, size_t alignment = FPM_ALIGNMENT) {
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+class AlignedBlock {
+    void* ptr_ = nullptr;
+    size_t bytes_ = 0;
+
+public:
+    AlignedBlock() = default;
+
+    explicit AlignedBlock(size_t bytes)
+        : bytes_(align_up(bytes)) {
+        if (bytes_ == 0) return;
+#if defined(_MSC_VER)
+        ptr_ = _aligned_malloc(bytes_, FPM_ALIGNMENT);
+        if (!ptr_) throw std::bad_alloc();
+#else
+        if (posix_memalign(&ptr_, FPM_ALIGNMENT, bytes_) != 0)
+            throw std::bad_alloc();
+#endif
+        std::memset(ptr_, 0, bytes_);
+    }
+
+    ~AlignedBlock() {
+#if defined(_MSC_VER)
+        _aligned_free(ptr_);
+#else
+        std::free(ptr_);
+#endif
+    }
+
+    AlignedBlock(const AlignedBlock&) = delete;
+    AlignedBlock& operator=(const AlignedBlock&) = delete;
+
+    AlignedBlock(AlignedBlock&& other) noexcept
+        : ptr_(other.ptr_), bytes_(other.bytes_) {
+        other.ptr_ = nullptr;
+        other.bytes_ = 0;
+    }
+
+    AlignedBlock& operator=(AlignedBlock&& other) noexcept {
+        if (this == &other) return *this;
+#if defined(_MSC_VER)
+        _aligned_free(ptr_);
+#else
+        std::free(ptr_);
+#endif
+        ptr_ = other.ptr_;
+        bytes_ = other.bytes_;
+        other.ptr_ = nullptr;
+        other.bytes_ = 0;
+        return *this;
+    }
+
+    uint8_t* bytes() { return static_cast<uint8_t*>(ptr_); }
+    const uint8_t* bytes() const { return static_cast<const uint8_t*>(ptr_); }
+    size_t size_bytes() const { return bytes_; }
+    uintptr_t address() const { return reinterpret_cast<uintptr_t>(ptr_); }
+    bool aligned(size_t alignment = FPM_ALIGNMENT) const {
+        return ptr_ == nullptr || (address() % alignment) == 0;
+    }
+};
+
+template <typename T>
+struct ArrayView {
+    T* data_ptr = nullptr;
+    size_t len = 0;
+
+    ArrayView() = default;
+    ArrayView(T* ptr, size_t length) : data_ptr(ptr), len(length) {}
+
+    inline T& operator[](size_t index) { return data_ptr[index]; }
+    inline const T& operator[](size_t index) const { return data_ptr[index]; }
+
+    T* data() { return data_ptr; }
+    const T* data() const { return data_ptr; }
+    size_t size() const { return len; }
+};
+
+template <typename T>
+inline ArrayView<T> map_view(uint8_t*& ptr, size_t count) {
+    ptr = reinterpret_cast<uint8_t*>(align_up(reinterpret_cast<uintptr_t>(ptr)));
+    T* typed = reinterpret_cast<T*>(ptr);
+    ptr += sizeof(T) * count;
+    return ArrayView<T>(typed, count);
+}
+
+inline size_t fpm_network_arena_bytes(size_t n_daemons, size_t n_pairs) {
+    size_t offset = 0;
+    auto add = [&](size_t count, size_t elem_size) {
+        offset = align_up(offset);
+        offset += count * elem_size;
+    };
+    for (int i = 0; i < 7; ++i) add(n_daemons, sizeof(double));
+    for (int i = 0; i < 3; ++i) add(n_daemons * 9, sizeof(double));
+    add(n_daemons, sizeof(uint8_t));
+    add(n_daemons, sizeof(int32_t));
+    add(n_pairs * 2, sizeof(int32_t));
+    return align_up(offset);
+}
+
+// ---------------------------------------------------------------------------
+// SoA network arena. This owns all network physical state.
+// ---------------------------------------------------------------------------
+
+struct FpmNetworkArena {
+    const size_t n_daemons;
+    const size_t n_pairs;
+
+    AlignedBlock memory_block;
+
+    ArrayView<double> E;
+    ArrayView<double> E_max;
+    ArrayView<double> b;
+    ArrayView<double> Omega;
+    ArrayView<double> kappa;
+    ArrayView<double> tau;
+    ArrayView<double> pi;
+
+    ArrayView<double> psi_re;
+    ArrayView<double> psi_im;
+    ArrayView<double> R;
+
+    ArrayView<uint8_t> mode;
+    ArrayView<int32_t> partner;
+    ArrayView<int32_t> pairs;
+
+    FpmNetworkArena(size_t daemons, size_t links)
+        : n_daemons(daemons),
+          n_pairs(links),
+          memory_block(fpm_network_arena_bytes(daemons, links)) {
+        if (daemons == 0)
+            throw std::invalid_argument("n_daemons must be positive");
+        uint8_t* ptr = memory_block.bytes();
+
+        E = map_view<double>(ptr, n_daemons);
+        E_max = map_view<double>(ptr, n_daemons);
+        b = map_view<double>(ptr, n_daemons);
+        Omega = map_view<double>(ptr, n_daemons);
+        kappa = map_view<double>(ptr, n_daemons);
+        tau = map_view<double>(ptr, n_daemons);
+        pi = map_view<double>(ptr, n_daemons);
+
+        psi_re = map_view<double>(ptr, n_daemons * 9);
+        psi_im = map_view<double>(ptr, n_daemons * 9);
+        R = map_view<double>(ptr, n_daemons * 9);
+
+        mode = map_view<uint8_t>(ptr, n_daemons);
+        partner = map_view<int32_t>(ptr, n_daemons);
+        pairs = map_view<int32_t>(ptr, n_pairs * 2);
+
+        for (size_t i = 0; i < n_daemons; ++i) {
+            E_max[i] = 1.0;
+            E[i] = 1.0;
+            Omega[i] = 0.85;
+            kappa[i] = 1.0;
+            tau[i] = 0.5;
+            pi[i] = 0.5;
+            mode[i] = FPM_MODE_FLOW;
+            partner[i] = -1;
+            for (size_t j = 0; j < 9; ++j) {
+                const size_t off = i * 9 + j;
+                psi_re[off] = (j == 0) ? 1.0 : 0.0;
+                psi_im[off] = 0.0;
+                R[off] = (j == 0 || j == 4 || j == 8) ? 1.0 : 0.0;
+            }
+        }
+        for (size_t i = 0; i < n_pairs * 2; ++i)
+            pairs[i] = -1;
+    }
+
+    size_t size_bytes() const { return memory_block.size_bytes(); }
+    bool aligned() const { return memory_block.aligned(); }
+
+    void validate_index(size_t idx) const {
+        if (idx >= n_daemons)
+            throw std::out_of_range("daemon index out of range");
+    }
+
+    double* routing_tensor(size_t idx) {
+        validate_index(idx);
+        return R.data() + idx * 9;
+    }
+
+    const double* routing_tensor(size_t idx) const {
+        validate_index(idx);
+        return R.data() + idx * 9;
+    }
+};
+
+class DaemonProxy {
+    FpmNetworkArena* arena_ = nullptr;
+    size_t idx_ = 0;
+
+public:
+    DaemonProxy(FpmNetworkArena& arena, size_t idx)
+        : arena_(&arena), idx_(idx) {
+        arena_->validate_index(idx_);
+    }
+
+    size_t index() const { return idx_; }
+    double E() const { return arena_->E[idx_]; }
+    double E_max() const { return arena_->E_max[idx_]; }
+    uint8_t mode() const { return arena_->mode[idx_]; }
+    double* R() { return arena_->routing_tensor(idx_); }
+    const double* R() const { return arena_->routing_tensor(idx_); }
+
+    void set_E(double value) { arena_->E[idx_] = value; }
+    void deduct_E(double amount) { arena_->E[idx_] = std::max(0.0, arena_->E[idx_] - amount); }
+};
+
+// ---------------------------------------------------------------------------
+// Private network math kernels operating on raw arena views.
+// ---------------------------------------------------------------------------
+
+inline double shear_aggregate(const double* R9) {
+    double sum_sq = 0.0;
+    for (size_t i = 0; i < 9; ++i)
+        sum_sq += R9[i] * R9[i];
+    return std::sqrt(sum_sq / 9.0);
+}
+
+inline double trace_curvature(const double* R9) {
+    return std::abs(R9[0] + R9[4] + R9[8]);
+}
+
+inline double mobility(double K1, double S9,
+                       double alpha = 0.2,
+                       double beta = 1.8,
+                       double A = 1.0) {
+    if (A < 0.0)
+        throw std::invalid_argument("A must be non-negative");
+    return A / (std::pow(1.0 + std::max(0.0, K1), alpha)
+                * std::pow(1.0 + std::max(0.0, S9), beta));
+}
+
+inline std::vector<int64_t> largest_remainder_counts(
+    const std::vector<double>& expected_counts,
+    int64_t total_count) {
+    if (total_count < 0)
+        throw std::invalid_argument("total_count must be non-negative");
+    std::vector<int64_t> counts(expected_counts.size(), 0);
+    std::vector<std::pair<double, size_t>> remainders;
+    remainders.reserve(expected_counts.size());
+
+    int64_t floor_sum = 0;
+    for (size_t i = 0; i < expected_counts.size(); ++i) {
+        if (expected_counts[i] < 0.0)
+            throw std::invalid_argument("expected counts must be non-negative");
+        const double floored = std::floor(expected_counts[i]);
+        counts[i] = static_cast<int64_t>(floored);
+        floor_sum += counts[i];
+        remainders.push_back({expected_counts[i] - floored, i});
+    }
+
+    int64_t remaining = total_count - floor_sum;
+    if (remaining < 0)
+        throw std::invalid_argument("floored counts exceed total_count");
+    std::sort(remainders.begin(), remainders.end(),
+              [](const auto& a, const auto& b) {
+                  if (a.first != b.first) return a.first > b.first;
+                  return a.second < b.second;
+              });
+    for (int64_t k = 0; k < remaining && k < static_cast<int64_t>(remainders.size()); ++k)
+        counts[remainders[static_cast<size_t>(k)].second] += 1;
+    return counts;
+}
+
+inline double angular_delta(double a, double b) {
+    double d = std::fmod(std::abs(a - b), FPM_PI);
+    return std::min(d, FPM_PI - d);
+}
+
+inline double bell_local_torsion_correlation(double a, double b) {
+    return 1.0 - 4.0 * angular_delta(a, b) / FPM_PI;
+}
+
+inline double geometric_torsion_correlation(double a, double b) {
+    return -std::cos(2.0 * (a - b));
+}
+
+struct JointTorsionResult {
+    std::vector<double> probabilities;
+    std::vector<int64_t> counts;
+    std::vector<double> quantized_probabilities;
+    double fpm_correlation = 0.0;
+    double tv_distance = 0.0;
+};
+
+inline JointTorsionResult joint_torsion_lrm_distribution(
+    double a, double b, int64_t n_bit_eq = 1000000) {
+    const double E_target = geometric_torsion_correlation(a, b);
+    std::vector<double> p_joint = {
+        (1.0 + E_target) / 4.0,
+        (1.0 - E_target) / 4.0,
+        (1.0 - E_target) / 4.0,
+        (1.0 + E_target) / 4.0,
+    };
+    std::vector<double> expected;
+    expected.reserve(p_joint.size());
+    for (double p : p_joint)
+        expected.push_back(p * static_cast<double>(n_bit_eq));
+    std::vector<int64_t> counts = largest_remainder_counts(expected, n_bit_eq);
+
+    std::vector<double> q;
+    q.reserve(counts.size());
+    for (int64_t c : counts)
+        q.push_back(static_cast<double>(c) / static_cast<double>(n_bit_eq));
+
+    JointTorsionResult out;
+    out.probabilities = std::move(p_joint);
+    out.counts = std::move(counts);
+    out.quantized_probabilities = std::move(q);
+    out.fpm_correlation = (
+        out.quantized_probabilities[0] - out.quantized_probabilities[1]
+        - out.quantized_probabilities[2] + out.quantized_probabilities[3]);
+    double tv = 0.0;
+    for (size_t i = 0; i < out.probabilities.size(); ++i)
+        tv += std::abs(out.quantized_probabilities[i] - out.probabilities[i]);
+    out.tv_distance = 0.5 * tv;
+    return out;
+}
+
+struct ViscosityOutput {
+    double Omega = 0.0;
+    double kappa = 0.0;
+    double C_N = 0.0;
+    double S9 = 0.0;
+    double K1 = 0.0;
+};
+
+struct LedgerOutput {
+    double pull_exhaust = 0.0;
+    double tv_distance = 0.0;
+    bool joint_quantization_executed = false;
+};
+
+class FpmNetwork {
+    FpmNetworkArena arena_;
+    double total_pull_exhaust_ = 0.0;
+    double total_route_spend_ = 0.0;
+    int64_t n_bit_eq_ = 1000000;
+
+public:
+    FpmNetwork(size_t n_daemons, size_t n_pairs = 0)
+        : arena_(n_daemons, n_pairs) {}
+
+    FpmNetworkArena& arena() { return arena_; }
+    const FpmNetworkArena& arena() const { return arena_; }
+
+    size_t n_daemons() const { return arena_.n_daemons; }
+    size_t n_pairs() const { return arena_.n_pairs; }
+    size_t arena_bytes() const { return arena_.size_bytes(); }
+    bool arena_aligned() const { return arena_.aligned(); }
+
+    double energy(size_t idx) const {
+        arena_.validate_index(idx);
+        return arena_.E[idx];
+    }
+
+    uint8_t mode(size_t idx) const {
+        arena_.validate_index(idx);
+        return arena_.mode[idx];
+    }
+
+    void set_energy(size_t idx, double E, double E_max) {
+        arena_.validate_index(idx);
+        if (E_max <= 0.0)
+            throw std::invalid_argument("E_max must be positive");
+        if (E < 0.0 || E > E_max)
+            throw std::invalid_argument("E must be in [0, E_max]");
+        arena_.E[idx] = E;
+        arena_.E_max[idx] = E_max;
+    }
+
+    void set_mode(size_t idx, uint8_t mode) {
+        arena_.validate_index(idx);
+        if (mode > FPM_MODE_ZOMBIE)
+            throw std::invalid_argument("mode must be FLOW=0, FATIGUE=1, or ZOMBIE=2");
+        arena_.mode[idx] = mode;
+    }
+
+    std::vector<double> routing_tensor(size_t idx) const {
+        const double* R9 = arena_.routing_tensor(idx);
+        return std::vector<double>(R9, R9 + 9);
+    }
+
+    void set_routing_tensor(size_t idx, const std::vector<double>& R9) {
+        if (R9.size() != 9)
+            throw std::invalid_argument("routing tensor must contain 9 values");
+        double* dst = arena_.routing_tensor(idx);
+        std::copy(R9.begin(), R9.end(), dst);
+    }
+
+    ViscosityOutput viscosity_update_from_routing(
+        size_t idx,
+        double B_load = 0.0,
+        double alpha = 0.2,
+        double beta = 1.8) {
+        arena_.validate_index(idx);
+        const double* R9 = arena_.routing_tensor(idx);
+        ViscosityOutput out;
+        out.S9 = shear_aggregate(R9);
+        out.K1 = trace_curvature(R9);
+        out.C_N = mobility(out.K1, out.S9, alpha, beta);
+        const double depletion = std::pow(1.0 + std::max(0.0, B_load), -0.75);
+        out.kappa = std::min(1.0, std::max(0.0, out.C_N * depletion));
+        out.Omega = std::min(0.85, std::max(0.50, 1.0 - out.kappa));
+        arena_.kappa[idx] = out.kappa;
+        arena_.Omega[idx] = out.Omega;
+        total_route_spend_ += 1e-5 * arena_.E_max[idx];
+        arena_.E[idx] = std::max(ENERGY_FLOOR_FRACTION * arena_.E_max[idx],
+                                 arena_.E[idx] - 1e-5 * arena_.E_max[idx]);
+        return out;
+    }
+
+    void force_zombie_starvation(size_t idx) {
+        arena_.validate_index(idx);
+        const double threshold = 0.20 * arena_.E_max[idx];
+        if (arena_.E[idx] > threshold) {
+            total_pull_exhaust_ += arena_.E[idx] - threshold;
+            arena_.E[idx] = threshold;
+        }
+        arena_.mode[idx] = FPM_MODE_ZOMBIE;
+    }
+
+    LedgerOutput resolve_torsion_link(size_t idx_a, size_t idx_b) {
+        arena_.validate_index(idx_a);
+        arena_.validate_index(idx_b);
+        if (idx_a == idx_b)
+            throw std::invalid_argument("torsion link requires two distinct daemons");
+        if (arena_.mode[idx_a] != FPM_MODE_ZOMBIE)
+            throw std::runtime_error("daemon A is not in ZOMBIE mode; starvation required");
+
+        LedgerOutput out;
+        const double zombie_threshold = 0.20 * arena_.E_max[idx_b];
+        if (arena_.E[idx_b] > zombie_threshold) {
+            out.pull_exhaust = arena_.E[idx_b] - zombie_threshold;
+            total_pull_exhaust_ += out.pull_exhaust;
+            arena_.E[idx_b] = zombie_threshold;
+            arena_.mode[idx_b] = FPM_MODE_ZOMBIE;
+        }
+
+        const auto q = joint_torsion_lrm_distribution(0.0, FPM_PI / 8.0, n_bit_eq_);
+        out.tv_distance = q.tv_distance;
+        out.joint_quantization_executed = true;
+        return out;
+    }
+
+    double total_pull_exhaust() const { return total_pull_exhaust_; }
+    double total_route_spend() const { return total_route_spend_; }
+};
 
 // ---------------------------------------------------------------------------
 // FalsificationError

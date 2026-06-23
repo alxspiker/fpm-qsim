@@ -180,6 +180,54 @@ static py::class_<ConservationLedger> make_ledger(py::module_& m) {
 }
 
 // --------------------------------------------------------------------------
+// Python-facing SoA FpmNetwork
+// --------------------------------------------------------------------------
+
+static py::class_<FpmNetwork> make_fpm_network(py::module_& m) {
+    py::class_<ViscosityOutput>(m, "ViscosityOutput")
+        .def_readonly("Omega", &ViscosityOutput::Omega)
+        .def_readonly("kappa", &ViscosityOutput::kappa)
+        .def_readonly("C_N", &ViscosityOutput::C_N)
+        .def_readonly("S9", &ViscosityOutput::S9)
+        .def_readonly("K1", &ViscosityOutput::K1);
+
+    py::class_<LedgerOutput>(m, "LedgerOutput")
+        .def_readonly("pull_exhaust", &LedgerOutput::pull_exhaust)
+        .def_readonly("tv_distance", &LedgerOutput::tv_distance)
+        .def_readonly("joint_quantization_executed",
+                      &LedgerOutput::joint_quantization_executed);
+
+    return py::class_<FpmNetwork>(m, "FpmNetwork")
+        .def(py::init<size_t, size_t>(),
+             py::arg("n_daemons"), py::arg("n_pairs") = 0)
+        .def_property_readonly("n_daemons", &FpmNetwork::n_daemons)
+        .def_property_readonly("n_pairs", &FpmNetwork::n_pairs)
+        .def_property_readonly("arena_bytes", &FpmNetwork::arena_bytes)
+        .def_property_readonly("arena_aligned", &FpmNetwork::arena_aligned)
+        .def("energy", &FpmNetwork::energy, py::arg("idx"))
+        .def("mode", &FpmNetwork::mode, py::arg("idx"))
+        .def("set_energy", &FpmNetwork::set_energy,
+             py::arg("idx"), py::arg("E"), py::arg("E_max"))
+        .def("set_mode", &FpmNetwork::set_mode,
+             py::arg("idx"), py::arg("mode"))
+        .def("routing_tensor", &FpmNetwork::routing_tensor, py::arg("idx"))
+        .def("set_routing_tensor", &FpmNetwork::set_routing_tensor,
+             py::arg("idx"), py::arg("R9"))
+        .def("viscosity_update_from_routing",
+             &FpmNetwork::viscosity_update_from_routing,
+             py::arg("idx"), py::arg("B_load") = 0.0,
+             py::arg("alpha") = 0.2, py::arg("beta") = 1.8)
+        .def("force_zombie_starvation", &FpmNetwork::force_zombie_starvation,
+             py::arg("idx"))
+        .def("resolve_torsion_link", &FpmNetwork::resolve_torsion_link,
+             py::arg("idx_a"), py::arg("idx_b"))
+        .def_property_readonly("total_pull_exhaust",
+                               &FpmNetwork::total_pull_exhaust)
+        .def_property_readonly("total_route_spend",
+                               &FpmNetwork::total_route_spend);
+}
+
+// --------------------------------------------------------------------------
 // bounded_gamma (with FalsificationError bridge to Python)
 // --------------------------------------------------------------------------
 
@@ -201,6 +249,9 @@ PYBIND11_MODULE(fpm_cpp, m) {
     m.attr("FALSIFICATION_THRESHOLD") = FALSIFICATION_THRESHOLD;
     m.attr("ENERGY_FLOOR_FRACTION")  = ENERGY_FLOOR_FRACTION;
     m.attr("ISOTROPIC_WEIGHT_LIMIT") = ISOTROPIC_WEIGHT_LIMIT;
+    m.attr("MODE_FLOW")              = FPM_MODE_FLOW;
+    m.attr("MODE_FATIGUE")           = FPM_MODE_FATIGUE;
+    m.attr("MODE_ZOMBIE")            = FPM_MODE_ZOMBIE;
 
     // Core functions
     m.def("kappa_from_gamma", &kappa_from_gamma,
@@ -235,6 +286,7 @@ PYBIND11_MODULE(fpm_cpp, m) {
     // DaemonState + Ledger
     make_daemon_state(m);
     make_ledger(m);
+    make_fpm_network(m);
 
     // exp_route_cost + bill_exp_route_cost
     m.def("exp_route_cost", [](int taylor_order) {

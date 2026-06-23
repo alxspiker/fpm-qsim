@@ -16,7 +16,20 @@ import numpy as np
 # Add the C++ module directory to path
 sys.path.insert(0, ".")
 
-import fpm_qsim as fpm_py
+try:
+    import fpm_qsim as fpm_py
+except ModuleNotFoundError:
+    if "pytest" in sys.modules:
+        import pytest
+        pytest.skip(
+            "Python reference package fpm_qsim is not installed; "
+            "equivalence_test.py is a manual reference comparison.",
+            allow_module_level=True,
+        )
+    raise SystemExit(
+        "Python reference package fpm_qsim is not installed. "
+        "Install the old Python reference package to run this equivalence script."
+    )
 import fpm_cpp
 
 
