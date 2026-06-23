@@ -1,79 +1,33 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = [
+    "setuptools>=64",
+    "wheel",
+    "pybind11>=2.12",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fpm-qsim"
-version = "0.1.8"
-description = "Drop-in Lindblad dephasing simulator backed by the Finite Possibility Mechanics affine map"
+version = "0.1.9"
+description = "C++ accelerated FPM quantum simulation primitives with Python bindings"
 readme = "README.md"
-license = {text = "MIT"}
-authors = [
-    {name = "Alx Spiker", email = "alx@fpm.framework"},
-]
-maintainers = [
-    {name = "Alx Spiker", email = "alx@fpm.framework"},
-]
-keywords = [
-    "quantum",
-    "lindblad",
-    "open-systems",
-    "decoherence",
-    "dephasing",
-    "density-matrix",
-    "finite-possibility-mechanics",
-    "fpm",
-    "simulation",
-]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Science/Research",
-    "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Physics",
-    "Topic :: Scientific/Engineering :: Mathematics",
-    "Topic :: Software Development :: Libraries :: Python Modules",
-]
 requires-python = ">=3.9"
+license = "MIT"
+authors = [
+    { name = "alxtheprogrammer" },
+]
 dependencies = [
     "numpy>=1.22",
 ]
-
-[project.optional-dependencies]
-test = [
-    "pytest>=7.0",
-    "scipy>=1.8",
-]
-viz = [
-    "matplotlib>=3.5",
-]
-dev = [
-    "pytest>=7.0",
-    "scipy>=1.8",
-    "matplotlib>=3.5",
-    "build>=0.10",
-    "twine>=4.0",
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Physics",
 ]
 
 [project.urls]
 Homepage = "https://github.com/alxspiker/fpm-qsim"
-Documentation = "https://github.com/alxspiker/fpm-qsim#readme"
 Repository = "https://github.com/alxspiker/fpm-qsim"
-Issues = "https://github.com/alxspiker/fpm-qsim/issues"
-
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-fpm_qsim = ["py.typed"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-python_files = ["test_*.py"]
-addopts = "-v --tb=short"

@@ -1,7 +1,12 @@
 include README.md
 include LICENSE
-include CHANGES.md
-recursive-include examples *.py
-recursive-include docs *.md
-recursive-include tests *.py
-recursive-include src/fpm_qsim py.typed
+include fpm_core.hpp
+include fpm_cpp_bindings.cpp
+include build.sh
+include equivalence_test.py
+include benchmark_v2.py
+recursive-include results *.csv *.json
+recursive-include charts *.png
+exclude fpm_cpp*.so
+exclude *.pdf
+

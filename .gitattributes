@@ -1,0 +1,10 @@
+*.pdf binary
+*.png binary
+*.so binary
+*.whl binary
+*.gz binary
+*.zip binary
+*.tar binary
+*.7z binary
+*.rar binary
+*.sh text eol=lf
