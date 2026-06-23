@@ -23,8 +23,8 @@ def linker_args() -> list[str]:
 ext_modules = [
     Pybind11Extension(
         "fpm_cpp",
-        ["fpm_cpp_bindings.cpp"],
-        include_dirs=["."],
+        ["src/fpm_cpp_bindings.cpp"],
+        include_dirs=["include"],
         cxx_std=17,
         define_macros=[("VERSION_INFO", f'"{VERSION}"')],
         extra_compile_args=compiler_args(),

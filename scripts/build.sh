@@ -3,7 +3,7 @@
 # =================================================================
 #
 # Usage:
-#   ./build.sh
+#   ./scripts/build.sh
 #
 # Outputs:
 #   fpm_cpp.cpython-<ver>-<arch>-linux-gnu.so  (the importable extension)
@@ -15,9 +15,10 @@
 #
 set -euo pipefail
 
-# Resolve script directory (so the script works from any CWD)
+# Resolve project root (so the script works from any CWD)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
 
 # Detect Python
 PYTHON="${PYTHON:-python3}"
@@ -63,8 +64,8 @@ echo ""
 echo "Compiling fpm_cpp bindings..."
 "$CC" -O3 $ARCH_FLAGS -ffast-math -fopenmp \
     -shared -std=c++17 -fPIC \
-    -I"$PY_INC" -I"$PYBIND_INC" \
-    fpm_cpp_bindings.cpp \
+    -I"$PY_INC" -I"$PYBIND_INC" -Iinclude \
+    src/fpm_cpp_bindings.cpp \
     -o "fpm_cpp${EXT_SUFFIX}" \
     -fopenmp
 
@@ -90,5 +91,5 @@ print('  OK')
 
 echo ""
 echo "Done. The module is now importable from Python:"
-echo "  import sys; sys.path.insert(0, '$SCRIPT_DIR')"
+echo "  import sys; sys.path.insert(0, '$PROJECT_ROOT')"
 echo "  import fpm_cpp"
