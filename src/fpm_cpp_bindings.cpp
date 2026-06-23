@@ -27,7 +27,7 @@ namespace py = pybind11;
 using namespace fpm_cpp;
 
 #ifndef VERSION_INFO
-#define VERSION_INFO "0.2.0"
+#define VERSION_INFO "0.2.1"
 #endif
 
 // --------------------------------------------------------------------------

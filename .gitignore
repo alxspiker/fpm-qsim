@@ -13,3 +13,4 @@ venv/
 *.pdf
 charts/
 results/
+scripts/benchmark_results/

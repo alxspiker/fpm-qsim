@@ -1,0 +1,132 @@
+{
+  "created_at_utc": "2026-06-23T07:56:05.406796+00:00",
+  "versions": {
+    "fpm_cpp": "0.2.1",
+    "numpy": "2.5.0",
+    "scipy": "1.18.0",
+    "qutip": "5.3.0",
+    "qiskit": "2.4.2",
+    "qiskit_aer": "0.17.2"
+  },
+  "pure_dephasing": {
+    "scenario": {
+      "name": "pure_dephasing_1q",
+      "gamma": 0.02,
+      "dt": 1.0,
+      "n_steps": 1000,
+      "expected_final_abs_rho01": 1.030576811219279e-09
+    },
+    "benchmarks": [
+      {
+        "name": "FPM C++ serial",
+        "median_ms": 0.0213999992411118,
+        "min_ms": 0.02029999996011611,
+        "max_ms": 0.09580000005371403,
+        "final_abs_rho01": 1.0305768112192258e-09,
+        "abs_error": 5.314635435653203e-23
+      },
+      {
+        "name": "FPM C++ OpenMP",
+        "median_ms": 0.02010000025620684,
+        "min_ms": 0.01990000055229757,
+        "max_ms": 0.02119999953720253,
+        "final_abs_rho01": 1.0305768112192258e-09,
+        "abs_error": 5.314635435653203e-23
+      },
+      {
+        "name": "SciPy expm step loop",
+        "median_ms": 1.5829999993002275,
+        "min_ms": 1.574399999299203,
+        "max_ms": 1.623699999981909,
+        "final_abs_rho01": 1.0305768112192258e-09,
+        "abs_error": 5.314635435653203e-23
+      },
+      {
+        "name": "SciPy expm total",
+        "median_ms": 0.002200000380980782,
+        "min_ms": 0.0021000014385208488,
+        "max_ms": 0.0034000004234258085,
+        "final_abs_rho01": 1.030576811219279e-09,
+        "abs_error": 0.0
+      },
+      {
+        "name": "SciPy solve_ivp",
+        "median_ms": 8.736199999475502,
+        "min_ms": 8.703600000444567,
+        "max_ms": 9.09499999943364,
+        "final_abs_rho01": 1.0307462337165568e-09,
+        "abs_error": 1.6942249727782345e-13
+      },
+      {
+        "name": "QuTiP mesolve default",
+        "median_ms": 0.7065000008878997,
+        "min_ms": 0.6592999998247251,
+        "max_ms": 1.405900000463589,
+        "final_abs_rho01": 5.070287473777293e-09,
+        "abs_error": 6.1008642849965725e-09
+      },
+      {
+        "name": "QuTiP mesolve tight",
+        "median_ms": 1.721600001474144,
+        "min_ms": 1.7007000005833106,
+        "max_ms": 1.7544000002089888,
+        "final_abs_rho01": 1.030572479139477e-09,
+        "abs_error": 4.332079801984424e-15
+      }
+    ],
+    "trajectory": {
+      "chart": "C:\\Users\\alxth\\OneDrive\\Desktop\\fpm-qsim\\scripts\\benchmark_results\\fpm_vs_sqm_trajectory.png",
+      "fpm_final_abs_rho01": 1.0305768112192258e-09,
+      "sqm_final_abs_rho01": 1.0305768112192258e-09,
+      "max_abs_delta_fpm_vs_sqm": 0.0,
+      "max_abs_delta_fpm_vs_analytic": 4.996003610813204e-16
+    }
+  },
+  "qiskit_aer": {
+    "available": true,
+    "phase_damping_error_type": "QuantumError"
+  },
+  "arena": {
+    "arena_sizes": [
+      {
+        "n": 1,
+        "arena_bytes": 960,
+        "arena_aligned": true,
+        "construct_ms": 0.020400000721565448
+      },
+      {
+        "n": 10,
+        "arena_bytes": 3392,
+        "arena_aligned": true,
+        "construct_ms": 0.00670000008540228
+      },
+      {
+        "n": 1000,
+        "arena_bytes": 281088,
+        "arena_aligned": true,
+        "construct_ms": 0.032500000088475645
+      },
+      {
+        "n": 100000,
+        "arena_bytes": 28100032,
+        "arena_aligned": true,
+        "construct_ms": 5.374900001697824
+      }
+    ],
+    "routing": {
+      "S9_observed": 5.627314338711377,
+      "S9_expected": 5.627314338711377,
+      "K1_observed": 15.0,
+      "K1_expected": 15.0,
+      "C_N_observed": 0.019088349469216653,
+      "C_N_expected": 0.019088349469216653
+    },
+    "zombie_gate": {
+      "pull_exhaust": 0.7,
+      "partner_energy_after": 0.2,
+      "partner_mode_after": 2,
+      "total_pull_exhaust": 0.7,
+      "joint_quantization_executed": true
+    }
+  }
+}

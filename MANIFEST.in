@@ -11,3 +11,4 @@ exclude *.pdf
 prune charts
 prune results
 prune dist
+prune scripts/benchmark_results
