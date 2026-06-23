@@ -1,10 +1,10 @@
 include README.md
 include LICENSE
-include src/include/fpm_core.hpp
+include src/fpm_core.hpp
 include src/fpm_cpp_bindings.cpp
-include src/scripts/build.sh
-include src/tests/equivalence_test.py
-include src/tests/smoke_test.py
+include scripts/build.sh
+include tests/equivalence_test.py
+include tests/smoke_test.py
 exclude fpm_cpp*.pyd
 exclude fpm_cpp*.so
 exclude *.pdf
