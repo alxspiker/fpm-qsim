@@ -24,7 +24,7 @@ ext_modules = [
     Pybind11Extension(
         "fpm_cpp",
         ["src/fpm_cpp_bindings.cpp"],
-        include_dirs=["include"],
+        include_dirs=["src/include"],
         cxx_std=17,
         define_macros=[("VERSION_INFO", f'"{VERSION}"')],
         extra_compile_args=compiler_args(),

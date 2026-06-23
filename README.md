@@ -19,15 +19,15 @@ import fpm_cpp as fpm
 
 ```text
 .
-├── include/
-│   └── fpm_core.hpp          # Header-only C++17 FPM core
 ├── src/
-│   └── fpm_cpp_bindings.cpp  # pybind11 extension bindings
-├── scripts/
-│   └── build.sh              # Manual Linux/macOS/WSL build helper
-├── tests/
-│   ├── smoke_test.py         # Fast installed-wheel smoke test
-│   └── equivalence_test.py   # Reference equivalence checks
+│   ├── include/
+│   │   └── fpm_core.hpp          # Header-only C++17 FPM core
+│   ├── fpm_cpp_bindings.cpp      # pybind11 extension bindings
+│   ├── scripts/
+│   │   └── build.sh              # Manual Linux/macOS/WSL build helper
+│   └── tests/
+│       ├── smoke_test.py         # Fast installed-wheel smoke test
+│       └── equivalence_test.py   # Reference equivalence checks
 ├── pyproject.toml            # PyPI build metadata
 ├── setup.py                  # Extension build configuration
 ├── MANIFEST.in               # Source distribution contents
@@ -76,8 +76,8 @@ Manual local build:
 
 ```bash
 python -m pip install pybind11 numpy
-./scripts/build.sh
-python tests/smoke_test.py
+./src/scripts/build.sh
+python src/tests/smoke_test.py
 ```
 
 On Windows, normal `pip install fpm-qsim` builds with MSVC when a matching wheel
@@ -116,10 +116,10 @@ Constants:
 After installing or building locally:
 
 ```bash
-python tests/smoke_test.py
+python src/tests/smoke_test.py
 ```
 
-`tests/equivalence_test.py` is retained for reference comparison workflows that
+`src/tests/equivalence_test.py` is retained for reference comparison workflows that
 also have the old Python implementation available.
 
 ## License
