@@ -1,8 +1,15 @@
 build/
+dist/
 *.egg-info/
 .pytest_cache/
 __pycache__/
 *.py[cod]
 .venv/
 venv/
-
+*.pyd
+*.so
+*.dll
+*.dylib
+*.pdf
+charts/
+results/

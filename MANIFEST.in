@@ -4,9 +4,10 @@ include fpm_core.hpp
 include fpm_cpp_bindings.cpp
 include build.sh
 include equivalence_test.py
-include benchmark_v2.py
-recursive-include results *.csv *.json
-recursive-include charts *.png
+include smoke_test.py
+exclude fpm_cpp*.pyd
 exclude fpm_cpp*.so
 exclude *.pdf
-
+prune charts
+prune results
+prune dist
