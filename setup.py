@@ -7,7 +7,7 @@ from pybind11.setup_helpers import Pybind11Extension, build_ext
 from setuptools import setup
 
 
-VERSION = "0.1.9"
+VERSION = "0.2.0"
 
 
 def compiler_args() -> list[str]:
